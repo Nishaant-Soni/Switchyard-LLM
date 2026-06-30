@@ -1,10 +1,5 @@
 # PRD — LLM Gateway / Inference Router
 
-**Project codename:** `llm-gateway`
-**Owner:** Nishaant Soni
-**Status:** Draft v1
-**Resume track:** AI Engineer (system-design depth)
-
 ---
 
 ## 1. Problem statement
