@@ -1,9 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Planning / scaffolding. Design is locked in [`PRD.md`](./PRD.md) and
-> [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md); code is being built phase by phase (see [Roadmap](#roadmap)).
->
-> **Codename:** `llm-gateway` · **Track:** AI Engineer (system-design depth)
+> **Status:** Planning / scaffolding. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
