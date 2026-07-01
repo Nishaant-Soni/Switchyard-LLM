@@ -24,9 +24,7 @@ class OpenAICompatAdapter(ProviderAdapter):
         self.api_key = api_key
         self.client = client
 
-    async def chat_completion(
-        self, request: ChatCompletionRequest
-    ) -> ChatCompletionResponse:
+    async def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         payload = request.model_dump(exclude_none=True)
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         resp = await self.client.post(

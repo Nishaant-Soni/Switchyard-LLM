@@ -4,7 +4,7 @@ Phase 0 covers the non-streaming request/response shape. `extra="allow"` on ever
 unknown OpenAI params/fields pass through unchanged instead of being silently dropped.
 """
 
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -13,7 +13,7 @@ class Message(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: str
-    content: Optional[Any] = None
+    content: Any | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -22,11 +22,11 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[Message]
     stream: bool = False
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    max_tokens: Optional[int] = None
-    n: Optional[int] = None
-    stop: Optional[Any] = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    n: int | None = None
+    stop: Any | None = None
 
 
 class Choice(BaseModel):
@@ -34,7 +34,7 @@ class Choice(BaseModel):
 
     index: int
     message: Message
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
 
 class Usage(BaseModel):
@@ -53,4 +53,4 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[Choice]
-    usage: Optional[Usage] = None
+    usage: Usage | None = None

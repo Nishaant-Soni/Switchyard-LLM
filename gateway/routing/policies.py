@@ -5,8 +5,8 @@ Keeping every policy return an ordered list (not just a single pick) means the r
 layer wraps the same interface with no rework."""
 
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass(frozen=True)

@@ -121,15 +121,19 @@ Two YAML files drive everything (config, not code):
 Shipped aliases: `fast` (Groq→Ollama), `smart` (Gemini→Groq), `cheap` (OpenRouter→Groq), and
 `balanced` (weighted 2:1 across two Groq models — demonstrates weighted routing with only a Groq key).
 
-## Tests
+## Development & tests
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest            # routing unit tests + live per-provider conformance
+
+ruff check .            # lint
+ruff format .           # auto-format (use --check in CI)
+pytest -q               # routing unit tests + live per-provider conformance
 ```
 
 Conformance tests make real upstream calls and **skip** providers that are unconfigured,
-rate-limited (429), or unreachable — so the suite is green with just a Groq key.
+rate-limited (429), or unreachable — so the suite is green with just a Groq key (and fully
+hermetic with none). Run everything from the project root.
 
 > **Target acceptance bar (later phases):** one-command `docker compose up` brings up the whole
 > stack (gateway + Redis + Prometheus + Grafana + Ollama), with an OpenAI SDK client against

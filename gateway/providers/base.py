@@ -22,6 +22,4 @@ class ProviderAdapter(ABC):
     name: str
 
     @abstractmethod
-    async def chat_completion(
-        self, request: ChatCompletionRequest
-    ) -> ChatCompletionResponse: ...
+    async def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse: ...

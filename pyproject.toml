@@ -3,3 +3,11 @@
 # not just `python -m pytest`. Run pytest from the project root.
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# pyflakes (F), pycodestyle errors/warnings (E/W), isort (I), pyupgrade (UP), bugbear (B).
+select = ["F", "E", "W", "I", "UP", "B"]
