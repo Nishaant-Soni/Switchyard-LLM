@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phase 1 complete — OpenAI-compatible gateway with a config-driven multi-provider fleet and policy-based routing (priority + weighted), non-streaming. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 2 complete — config-driven multi-provider routing **with resilience** (per-provider circuit breakers + jittered-backoff retry + cross-provider fallback), non-streaming. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -121,6 +121,21 @@ Two YAML files drive everything (config, not code):
 Shipped aliases: `fast` (Groq→Ollama), `smart` (Gemini→Groq), `cheap` (OpenRouter→Groq), and
 `balanced` (weighted 2:1 across two Groq models — demonstrates weighted routing with only a Groq key).
 
+### Resilience
+
+The router's ordered targets are executed through per-provider **circuit breakers** with
+**jittered-backoff retry** and **cross-provider fallback**:
+
+- `429` / `5xx` / timeouts / transport errors → advance to the next target (retrying a struggling
+  backend just amplifies its load). Other `4xx` (client errors) surface immediately.
+- Each breaker trips `closed → open` on a failure-rate threshold over a rolling window, probes
+  `half-open` after a reset timeout, and closes again on a successful probe.
+- The served target is reported in the `x-switchyard-provider` / `x-switchyard-model` response
+  headers; live breaker states are exposed at `GET /healthz` (`{"circuits": {...}}`).
+
+So pointing a primary target at a dead URL yields a normal `200` served by the next provider —
+no client-visible error.
+
 ## Development & tests
 
 ```bash
@@ -152,7 +167,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 |---|---|---|
 | 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ✅ |
 | 1 | Multi-provider registry + priority/weighted routing | ✅ |
-| 2 | Resilience — circuit breaker + retry + cross-provider fallback | ☐ |
+| 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ☐ |
 | 4 | Semantic cache (the headline) | ☐ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ☐ |
