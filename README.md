@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Planning / scaffolding. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 0 complete — a working OpenAI-compatible passthrough gateway (Groq backend, non-streaming). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -80,30 +80,39 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (Phase 8) for the full requ
 
 ## Quickstart
 
-> Not yet runnable — these are the **target** commands once Phase 0 lands. The acceptance bar is:
-> one-command `docker compose up`, and an OpenAI SDK client against `localhost` getting correct
-> streamed and non-streamed completions.
+**Phase 0 (works today)** — OpenAI-compatible passthrough to Groq, non-streaming.
 
 ```bash
-# 1. Provider keys
-cp .env.example .env        # then add free-tier keys for Groq / Gemini / OpenRouter
+# 1. Provider key
+cp .env.example .env        # then set GROQ_API_KEY=gsk_...  (https://console.groq.com/keys)
 
-# 2. Bring up the whole stack (gateway + Redis + Prometheus + Grafana + Ollama)
-docker compose up
+# 2a. Run locally
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn gateway.main:app --port 8000
+
+# 2b. …or via Docker
+docker compose up --build
 
 # 3. Point any OpenAI SDK client at the gateway
 python - <<'PY'
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="<tenant-key>")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused-in-phase0")
 print(client.chat.completions.create(
-    model="fast",                         # logical alias, not a real model name
+    model="llama-3.3-70b-versatile",      # Phase 0: a real Groq model (aliases arrive in Phase 1)
     messages=[{"role": "user", "content": "Hello from the gateway"}],
 ).choices[0].message.content)
 PY
 ```
 
-> **First run note:** `sentence-transformers` downloads the MiniLM weights (~80 MB) on first use —
-> the first request may pause while that completes; it is not a hang.
+Endpoints: `POST /v1/chat/completions`, `GET /healthz`, `GET /metrics` (stub until Phase 6).
+Streaming returns `501` until Phase 5.
+
+> **Target acceptance bar (later phases):** one-command `docker compose up` brings up the whole
+> stack (gateway + Redis + Prometheus + Grafana + Ollama), with an OpenAI SDK client against
+> `localhost` getting correct streamed and non-streamed completions via logical aliases.
+>
+> **First-run note (from Phase 4 on):** `sentence-transformers` downloads the MiniLM weights
+> (~80 MB) on first use — the first request may pause while that completes; it is not a hang.
 
 ---
 
@@ -113,7 +122,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ☐ |
+| 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ✅ |
 | 1 | Multi-provider registry + priority/weighted routing | ☐ |
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ☐ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ☐ |
