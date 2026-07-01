@@ -1,15 +1,17 @@
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Populate os.environ from .env so the registry can resolve per-provider api_key_env names.
+load_dotenv()
 
 
 class Settings(BaseSettings):
-    """Gateway settings. Phase 0: a single Groq backend, read from the environment."""
-
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    groq_api_key: str
-    groq_base_url: str = "https://api.groq.com/openai/v1"
+    providers_config: str = "config/providers.yaml"
+    models_config: str = "config/models.yaml"
     request_timeout_s: float = 60.0
 
 

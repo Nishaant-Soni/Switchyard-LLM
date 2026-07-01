@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phase 0 complete — a working OpenAI-compatible passthrough gateway (Groq backend, non-streaming). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 1 complete — OpenAI-compatible gateway with a config-driven multi-provider fleet and policy-based routing (priority + weighted), non-streaming. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -80,10 +80,10 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (Phase 8) for the full requ
 
 ## Quickstart
 
-**Phase 0 (works today)** — OpenAI-compatible passthrough to Groq, non-streaming.
+**Works today** — OpenAI-compatible gateway routing logical aliases across the provider fleet, non-streaming.
 
 ```bash
-# 1. Provider key
+# 1. Provider key(s) — Groq is enough to start; others are optional
 cp .env.example .env        # then set GROQ_API_KEY=gsk_...  (https://console.groq.com/keys)
 
 # 2a. Run locally
@@ -93,19 +93,43 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # 2b. …or via Docker
 docker compose up --build
 
-# 3. Point any OpenAI SDK client at the gateway
+# 3. Point any OpenAI SDK client at the gateway — send a logical ALIAS as the model
 python - <<'PY'
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused-in-phase0")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused-until-phase3")
 print(client.chat.completions.create(
-    model="llama-3.3-70b-versatile",      # Phase 0: a real Groq model (aliases arrive in Phase 1)
+    model="fast",     # alias, not a real model name → resolved by routing policy
     messages=[{"role": "user", "content": "Hello from the gateway"}],
 ).choices[0].message.content)
 PY
 ```
 
 Endpoints: `POST /v1/chat/completions`, `GET /healthz`, `GET /metrics` (stub until Phase 6).
-Streaming returns `501` until Phase 5.
+Streaming returns `501` until Phase 5. Unknown aliases return `400`.
+
+### Configuring the fleet & routing
+
+Two YAML files drive everything (config, not code):
+
+- **`config/providers.yaml`** — each provider's `base_url`, `auth`, and `api_key_env`. A provider
+  whose key is unset is skipped at startup (the gateway still runs on whatever's configured).
+- **`config/models.yaml`** — each alias → an ordered list of `(provider, model)` targets + a
+  routing `policy`:
+  - `priority` — try targets in listed order (failover *wiring* lands in Phase 2).
+  - `weighted` — split traffic across targets by `weight`.
+
+Shipped aliases: `fast` (Groq→Ollama), `smart` (Gemini→Groq), `cheap` (OpenRouter→Groq), and
+`balanced` (weighted 2:1 across two Groq models — demonstrates weighted routing with only a Groq key).
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest            # routing unit tests + live per-provider conformance
+```
+
+Conformance tests make real upstream calls and **skip** providers that are unconfigured,
+rate-limited (429), or unreachable — so the suite is green with just a Groq key.
 
 > **Target acceptance bar (later phases):** one-command `docker compose up` brings up the whole
 > stack (gateway + Redis + Prometheus + Grafana + Ollama), with an OpenAI SDK client against
@@ -123,7 +147,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | Phase | Deliverable | Status |
 |---|---|---|
 | 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ✅ |
-| 1 | Multi-provider registry + priority/weighted routing | ☐ |
+| 1 | Multi-provider registry + priority/weighted routing | ✅ |
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ☐ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ☐ |
 | 4 | Semantic cache (the headline) | ☐ |

@@ -28,9 +28,10 @@ class OpenAICompatAdapter(ProviderAdapter):
         self, request: ChatCompletionRequest
     ) -> ChatCompletionResponse:
         payload = request.model_dump(exclude_none=True)
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         resp = await self.client.post(
             f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers=headers,
             json=payload,
         )
         if not resp.is_success:

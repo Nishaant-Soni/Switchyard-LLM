@@ -1,0 +1,28 @@
+# Logical alias -> ordered concrete targets + routing policy.
+#   priority = try targets in listed order (cross-provider failover wiring lands in Phase 2).
+#   weighted = split traffic across targets by weight.
+aliases:
+  fast:
+    policy: priority
+    targets:
+      - { provider: groq,   model: llama-3.3-70b-versatile }
+      - { provider: ollama, model: llama3.2 }
+
+  smart:
+    policy: priority
+    targets:
+      - { provider: gemini, model: gemini-3-flash-preview }  # reasoning model; needs token headroom
+      - { provider: groq,   model: llama-3.3-70b-versatile }
+
+  cheap:
+    policy: priority
+    targets:
+      - { provider: openrouter, model: "openai/gpt-oss-120b:free" }  # free models are volatile; falls back to Groq
+      - { provider: groq,       model: llama-3.1-8b-instant }
+
+  # Demonstrates weighted routing with only a Groq key (both targets are Groq models).
+  balanced:
+    policy: weighted
+    targets:
+      - { provider: groq, model: llama-3.3-70b-versatile, weight: 2 }
+      - { provider: groq, model: llama-3.1-8b-instant,    weight: 1 }

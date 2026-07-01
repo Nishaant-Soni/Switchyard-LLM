@@ -1,0 +1,23 @@
+# Provider fleet. A thin OpenAI-compatible adapter needs only base_url + auth.
+# `limits` is declared here as CONFIG (not code) but is not enforced until Phase 3.
+# A provider is skipped at startup if its api_key_env is unset (except auth: none).
+providers:
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    auth: bearer
+
+  gemini:
+    type: gemini                       # uses the GeminiAdapter subclass
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key_env: GEMINI_API_KEY
+    auth: bearer
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    auth: bearer
+
+  ollama:
+    base_url: http://localhost:11434/v1
+    auth: none                         # local, no key required

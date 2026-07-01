@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Add the project root to sys.path so `pytest` (bare) can import the `gateway` package,
+# not just `python -m pytest`. Run pytest from the project root.
+pythonpath = ["."]
+testpaths = ["tests"]
