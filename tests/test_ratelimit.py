@@ -117,16 +117,92 @@ def test_extract_bearer():
     assert extract_bearer("") is None
 
 
+# --- reconciliation ----------------------------------------------------------------------
+async def _read_tokens(client, tenant_id):
+    return float(await client.hget(f"rl:{tenant_id}:tok", "tokens"))
+
+
+def test_reconcile_refunds_when_over_estimated():
+    async def run():
+        client = _client()
+        limiter = RateLimiter(client, window_s=60, now=lambda: 1000.0)
+        tenant = Tenant("r1", requests_per_min=100, tokens_per_min=1000)
+        await limiter.check(tenant, estimated_tokens=500)  # 1000 -> 500
+        await limiter.reconcile(tenant, actual_tokens=100, estimated_tokens=500)  # +400
+        return await _read_tokens(client, "r1")
+
+    assert asyncio.run(run()) == 900  # 500 + (500 - 100)
+
+
+def test_reconcile_charges_when_under_estimated():
+    async def run():
+        client = _client()
+        limiter = RateLimiter(client, window_s=60, now=lambda: 1000.0)
+        tenant = Tenant("r2", requests_per_min=100, tokens_per_min=1000)
+        await limiter.check(tenant, estimated_tokens=100)  # 1000 -> 900
+        await limiter.reconcile(tenant, actual_tokens=600, estimated_tokens=100)  # -500
+        return await _read_tokens(client, "r2")
+
+    assert asyncio.run(run()) == 400  # 900 - (600 - 100)
+
+
+def test_reconcile_can_drive_bucket_negative_and_throttle():
+    async def run():
+        client = _client()
+        limiter = RateLimiter(client, window_s=60, now=lambda: 1000.0)
+        tenant = Tenant("r3", requests_per_min=100, tokens_per_min=100)
+        await limiter.check(tenant, estimated_tokens=50)  # 100 -> 50
+        await limiter.reconcile(tenant, actual_tokens=300, estimated_tokens=50)  # -250 -> -200
+        level = await _read_tokens(client, "r3")
+        blocked = await limiter.check(tenant, estimated_tokens=1)  # debt throttles
+        return level, blocked.allowed
+
+    level, allowed = asyncio.run(run())
+    assert level == -200
+    assert allowed is False
+
+
+def test_reconcile_noop_when_exact():
+    async def run():
+        client = _client()
+        limiter = RateLimiter(client, window_s=60, now=lambda: 1000.0)
+        tenant = Tenant("r4", requests_per_min=100, tokens_per_min=1000)
+        await limiter.check(tenant, estimated_tokens=200)
+        return await limiter.reconcile(tenant, actual_tokens=200, estimated_tokens=200)
+
+    assert asyncio.run(run()) is None
+
+
 # --- estimator ---------------------------------------------------------------------------
-def test_estimate_tokens_heuristic():
+def test_estimate_tokens_heuristic_fallback():
     req = ChatCompletionRequest(
         model="fast",
         messages=[Message(role="user", content="a" * 40)],
         max_tokens=100,
     )
-    assert estimate_tokens(req) == (40 // 4 + 1) + 100
+    # encoder=None forces the heuristic: overhead(3) + chars/4+1(11) + output(100)
+    assert estimate_tokens(req, encoder=None) == 3 + (40 // 4 + 1) + 100
 
 
 def test_estimate_tokens_default_output_when_no_max():
     req = ChatCompletionRequest(model="fast", messages=[Message(role="user", content="hi")])
-    assert estimate_tokens(req) == (2 // 4 + 1) + 256
+    assert estimate_tokens(req, encoder=None) == 3 + (2 // 4 + 1) + 256
+
+
+def test_estimate_tokens_with_injected_encoder():
+    class WordEncoder:
+        def encode(self, text):
+            return text.split()
+
+    req = ChatCompletionRequest(
+        model="fast",
+        messages=[Message(role="user", content="one two three")],
+        max_tokens=10,
+    )
+    # overhead(3) + 3 words + output(10)
+    assert estimate_tokens(req, encoder=WordEncoder()) == 3 + 3 + 10
+
+
+def test_estimate_tokens_default_encoder_is_positive():
+    req = ChatCompletionRequest(model="fast", messages=[Message(role="user", content="hello")])
+    assert estimate_tokens(req) > 0

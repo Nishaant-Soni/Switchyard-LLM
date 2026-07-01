@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phase 3 (Group 1) complete — resilient multi-provider routing **plus per-tenant rate limiting** (Redis token-bucket on request *and* token rate). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 3 complete — resilient multi-provider routing **plus per-tenant rate limiting** (Redis token-bucket on request *and* token rate, with tiktoken estimation reconciled against real usage). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -153,8 +153,11 @@ tenants:
   the **token limit usually binds before the request limit**.
 - Over-budget → `429` with a `Retry-After` header. Counters live in Redis, so they **survive gateway
   restarts** and are shared across instances.
-- Admission currently charges a heuristic token estimate; Phase 3 Group 2 adds `tiktoken` estimation
-  and post-call reconciliation against the provider's real `usage`.
+- Admission charges a **`tiktoken`** pre-call estimate; after the response, the token bucket is
+  **reconciled** against the provider's real `usage.total_tokens` (refund if over-estimated, extra
+  charge if under). tiktoken is an approximation for non-OpenAI tokenizers — reconciliation makes it
+  exact. (First rate-limited request lazily downloads the tiktoken vocab; it falls back to a
+  heuristic if offline.)
 
 Bring up Redis with the stack via `docker compose up`, or run it standalone
 (`docker run -p 6379:6379 redis:7-alpine`) for local dev.
@@ -192,7 +195,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ✅ |
 | 1 | Multi-provider registry + priority/weighted routing | ✅ |
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
-| 3 | Rate limiting — Redis, per-tenant, request + token aware | ◑ Group 1 done (Group 2 = tiktoken + reconciliation) |
+| 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
 | 4 | Semantic cache (the headline) | ☐ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ☐ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |

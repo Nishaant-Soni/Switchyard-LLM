@@ -99,3 +99,17 @@ class RateLimiter:
         if isinstance(retry, bytes):
             retry = retry.decode()
         return RateLimitResult(bool(allowed), float(retry), blocked)
+
+    async def reconcile(
+        self, tenant: Tenant, actual_tokens: int, estimated_tokens: int
+    ) -> float | None:
+        """Correct the token bucket after a call: admission charged the estimate, so add back the
+        delta (estimate − actual). Refund if we over-estimated, extra charge if we under-estimated.
+
+        Touches only the token bucket (request count was already exact). May drive the bucket
+        negative (debt) on a big under-estimate; a later refill clamps a refund at capacity.
+        """
+        adjustment = estimated_tokens - actual_tokens
+        if adjustment == 0:
+            return None
+        return await self.client.hincrbyfloat(f"rl:{tenant.id}:tok", "tokens", adjustment)

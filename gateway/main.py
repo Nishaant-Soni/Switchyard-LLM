@@ -93,11 +93,14 @@ async def chat_completions(
         )
 
     tenants: TenantRegistry = app.state.tenants
+    tenant = None
+    estimated_tokens = 0
     if tenants.enabled:
         tenant = tenants.resolve(extract_bearer(authorization))
         if tenant is None:
             return _error(401, "Invalid or missing API key.", "invalid_api_key")
-        rl = await app.state.limiter.check(tenant, estimate_tokens(request))
+        estimated_tokens = estimate_tokens(request)
+        rl = await app.state.limiter.check(tenant, estimated_tokens)
         if not rl.allowed:
             resp = _error(
                 429,
@@ -135,6 +138,10 @@ async def chat_completions(
             f"All targets failed for alias {request.model!r}: {last}",
             "all_targets_failed",
         )
+
+    # Reconcile the token bucket against actual usage (Group 2): admission charged the estimate.
+    if tenant is not None and result.usage is not None:
+        await app.state.limiter.reconcile(tenant, result.usage.total_tokens, estimated_tokens)
 
     response.headers["x-switchyard-provider"] = target.provider
     response.headers["x-switchyard-model"] = target.model

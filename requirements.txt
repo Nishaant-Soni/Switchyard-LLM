@@ -6,3 +6,4 @@ pydantic-settings==2.7.0
 python-dotenv==1.0.1
 PyYAML==6.0.2
 redis==5.2.1
+tiktoken==0.8.0
