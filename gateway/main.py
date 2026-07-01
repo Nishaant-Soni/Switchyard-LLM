@@ -1,24 +1,29 @@
-"""Switchyard LLM Gateway — Phase 2: resilient multi-provider routing.
+"""Switchyard LLM Gateway — Phase 3 (Group 1): per-tenant rate limiting.
 
-Client sends a logical alias as `model`; the router resolves it to ordered targets; the resilient
-executor runs them through per-provider circuit breakers with jittered-backoff retry and
-cross-provider fallback, so a dead/throttled backend never reaches the client as an error.
+Request pipeline: auth (API key -> tenant) -> rate-limit admission (Redis token-bucket on request
+rate AND token rate) -> routing -> resilient execution. Rate limiting is active only when tenants
+are configured in config/tenants.yaml; otherwise the gateway runs open (no Redis needed).
 """
 
 import logging
+import math
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Response
+import redis.asyncio as redis
+from fastapi import FastAPI, Header, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from gateway.config import get_settings
 from gateway.providers.base import UpstreamError
 from gateway.providers.registry import ProviderRegistry
+from gateway.ratelimit.estimate import estimate_tokens
+from gateway.ratelimit.limiter import RateLimiter
 from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.router import Router
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
+from gateway.tenancy.auth import TenantRegistry, extract_bearer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway")
@@ -33,6 +38,17 @@ async def lifespan(app: FastAPI):
     app.state.router = Router.from_config(settings.models_config)
     app.state.breakers = BreakerRegistry()
     app.state.executor = ResilientExecutor(app.state.breakers)
+
+    app.state.tenants = TenantRegistry.from_config(settings.tenants_config)
+    app.state.redis = None
+    app.state.limiter = None
+    if app.state.tenants.enabled:
+        app.state.redis = redis.from_url(settings.redis_url)
+        app.state.limiter = RateLimiter(app.state.redis, window_s=settings.rate_limit_window_s)
+        logger.info("rate limiting ENABLED (redis=%s)", settings.redis_url)
+    else:
+        logger.info("rate limiting disabled (no tenants configured)")
+
     logger.info(
         "gateway ready: providers=%s aliases=%s",
         app.state.registry.available(),
@@ -40,9 +56,11 @@ async def lifespan(app: FastAPI):
     )
     yield
     await client.aclose()
+    if app.state.redis is not None:
+        await app.state.redis.aclose()
 
 
-app = FastAPI(title="Switchyard LLM Gateway", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Switchyard LLM Gateway", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -64,11 +82,30 @@ def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completions(request: ChatCompletionRequest, response: Response):
+async def chat_completions(
+    request: ChatCompletionRequest,
+    response: Response,
+    authorization: str | None = Header(default=None),
+):
     if request.stream:
         return _error(
             501, "Streaming is not supported yet (arrives in Phase 5).", "not_implemented"
         )
+
+    tenants: TenantRegistry = app.state.tenants
+    if tenants.enabled:
+        tenant = tenants.resolve(extract_bearer(authorization))
+        if tenant is None:
+            return _error(401, "Invalid or missing API key.", "invalid_api_key")
+        rl = await app.state.limiter.check(tenant, estimate_tokens(request))
+        if not rl.allowed:
+            resp = _error(
+                429,
+                f"Rate limit exceeded for tenant {tenant.id!r} ({rl.blocked_dimension}).",
+                "rate_limit_exceeded",
+            )
+            resp.headers["Retry-After"] = str(max(1, math.ceil(rl.retry_after_s)))
+            return resp
 
     router: Router = app.state.router
     registry: ProviderRegistry = app.state.registry

@@ -1,0 +1,17 @@
+# API key -> tenant + per-minute rate limits.
+# IMPORTANT: if `tenants` is empty, auth + rate limiting are DISABLED (backward-compatible —
+# any api_key works, no Redis needed). Add entries below to turn enforcement on; once enabled,
+# an unknown/missing key is rejected with 401.
+#
+# Example (uncomment + set your own keys to enable):
+# tenants:
+#   sk-free-demo:
+#     tenant: free
+#     requests_per_min: 20
+#     tokens_per_min: 2000
+#   sk-pro-demo:
+#     tenant: pro
+#     requests_per_min: 120
+#     tokens_per_min: 100000
+
+tenants: {}

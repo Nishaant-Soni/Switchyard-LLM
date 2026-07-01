@@ -12,7 +12,11 @@ class Settings(BaseSettings):
 
     providers_config: str = "config/providers.yaml"
     models_config: str = "config/models.yaml"
+    tenants_config: str = "config/tenants.yaml"
     request_timeout_s: float = 60.0
+
+    redis_url: str = "redis://localhost:6379/0"
+    rate_limit_window_s: int = 60
 
 
 @lru_cache

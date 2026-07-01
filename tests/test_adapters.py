@@ -48,10 +48,11 @@ async def _call(provider: str, model: str) -> ChatCompletionResponse:
         except httpx.RequestError as exc:
             pytest.skip(f"provider {provider!r} unreachable: {exc}")
         except UpstreamError as exc:
-            if exc.status_code == 429:
-                # Free-tier quota exhaustion is expected (PRD §10); Phase 2 fallback handles
-                # it in production. It says nothing about OpenAI-conformance, so skip.
-                pytest.skip(f"provider {provider!r} rate-limited (429)")
+            if exc.status_code == 429 or exc.status_code >= 500:
+                # Transient availability: 429 = free-tier quota, 5xx = upstream overloaded
+                # (PRD §10). Phase 2 fallback handles these in production, and they say nothing
+                # about OpenAI-conformance, so skip. Genuine issues (400/401/404) still fail.
+                pytest.skip(f"provider {provider!r} unavailable ({exc.status_code})")
             raise
 
 

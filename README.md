@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phase 2 complete — config-driven multi-provider routing **with resilience** (per-provider circuit breakers + jittered-backoff retry + cross-provider fallback), non-streaming. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 3 (Group 1) complete — resilient multi-provider routing **plus per-tenant rate limiting** (Redis token-bucket on request *and* token rate). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -134,6 +134,31 @@ The router's ordered targets are executed through per-provider **circuit breaker
 So pointing a primary target at a dead URL yields a normal `200` served by the next provider —
 no client-visible error.
 
+### Rate limiting (per tenant)
+
+`config/tenants.yaml` maps an API key → a tenant with **per-minute request and token limits**:
+
+```yaml
+tenants:
+  sk-free-demo:
+    tenant: free
+    requests_per_min: 20
+    tokens_per_min: 2000
+```
+
+- **Disabled by default:** if `tenants.yaml` has no tenants, auth + rate limiting are off (no Redis
+  needed) and any `api_key` works. Add a tenant to turn enforcement on; an unknown key then → `401`.
+- **Two-dimensional token-bucket in Redis** (atomic via a Lua script): a request is admitted only if
+  both the request-rate and token-rate buckets have capacity. Because LLM cost is token-denominated,
+  the **token limit usually binds before the request limit**.
+- Over-budget → `429` with a `Retry-After` header. Counters live in Redis, so they **survive gateway
+  restarts** and are shared across instances.
+- Admission currently charges a heuristic token estimate; Phase 3 Group 2 adds `tiktoken` estimation
+  and post-call reconciliation against the provider's real `usage`.
+
+Bring up Redis with the stack via `docker compose up`, or run it standalone
+(`docker run -p 6379:6379 redis:7-alpine`) for local dev.
+
 ## Development & tests
 
 ```bash
@@ -145,8 +170,9 @@ pytest -q               # routing unit tests + live per-provider conformance
 ```
 
 Conformance tests make real upstream calls and **skip** providers that are unconfigured,
-rate-limited (429), or unreachable — so the suite is green with just a Groq key (and fully
-hermetic with none). Run everything from the project root.
+unreachable, or returning a transient upstream error (`429` quota / `5xx` overload) — so the suite
+is green with just a Groq key (and fully hermetic with none). Genuine problems (`400`/`401`/`404`)
+still fail. Run everything from the project root.
 
 > **Target acceptance bar (later phases):** one-command `docker compose up` brings up the whole
 > stack (gateway + Redis + Prometheus + Grafana + Ollama), with an OpenAI SDK client against
@@ -166,7 +192,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 0 | Walking skeleton — OpenAI SDK → gateway → one provider → response | ✅ |
 | 1 | Multi-provider registry + priority/weighted routing | ✅ |
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
-| 3 | Rate limiting — Redis, per-tenant, request + token aware | ☐ |
+| 3 | Rate limiting — Redis, per-tenant, request + token aware | ◑ Group 1 done (Group 2 = tiktoken + reconciliation) |
 | 4 | Semantic cache (the headline) | ☐ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ☐ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |
