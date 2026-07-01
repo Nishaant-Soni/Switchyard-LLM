@@ -8,3 +8,4 @@ __pycache__/
 .deepeval/
 docs/
 .ruff_cache/
+.pytest_cache/
