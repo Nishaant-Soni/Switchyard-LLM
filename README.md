@@ -74,8 +74,6 @@ All four expose an OpenAI-compatible `chat/completions` surface, keeping the ada
 at startup. Live signals (per-provider p95 latency, breaker state) computed by the observability
 layer feed the latency-/cost-aware policies — so observability is an *input* to routing, not a bolt-on.
 
-See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (Phase 8) for the full request lifecycle and design-decision rationale.
-
 ---
 
 ## Quickstart
@@ -214,7 +212,6 @@ Cost is a **counterfactual** ("what this would cost on paid tiers"), since all p
 ## Documents
 
 - [`PRD.md`](./PRD.md) — problem, goals/non-goals, component specs, provider quirks, risks
-- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) — phase-by-phase build plan + target repo layout
 
 ## Non-goals
 
