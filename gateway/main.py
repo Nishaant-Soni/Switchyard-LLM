@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
         await app.state.redis.aclose()
 
 
-app = FastAPI(title="Switchyard LLM Gateway", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Switchyard LLM Gateway", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
