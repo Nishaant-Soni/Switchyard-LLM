@@ -5,6 +5,7 @@ fake deterministic one in tests (keeps CI hermetic — no torch weights download
 **L2-normalized**, so a cosine-similarity cache reduces to inner-product search in FAISS.
 """
 
+import threading
 from typing import Protocol
 
 import numpy as np
@@ -25,11 +26,20 @@ class SentenceTransformerEmbedder:
         self.model_name = model_name
         self.device = device
         self._model = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self):
+        # Double-checked lock: embed runs in a threadpool (see main.py), so concurrent first calls
+        # must not each load the ~80MB model. Fast path skips the lock once loaded.
+        if self._model is None:
+            with self._lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
+
+                    self._model = SentenceTransformer(self.model_name, device=self.device)
+        return self._model
 
     def embed(self, texts: list[str]) -> np.ndarray:
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-
-            self._model = SentenceTransformer(self.model_name, device=self.device)
-        vecs = self._model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        model = self._ensure_model()
+        vecs = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         return np.asarray(vecs, dtype="float32")

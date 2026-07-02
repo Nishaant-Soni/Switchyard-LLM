@@ -179,6 +179,9 @@ Near-duplicate prompts are served from an in-process cache instead of re-hitting
 - **Flow:** embed the prompt locally (`sentence-transformers` MiniLM-L6-v2, CPU, 384-dim,
   L2-normalized) → FAISS `IndexFlatIP` nearest-neighbor search within the request's **scope** → if
   cosine ≥ threshold, serve the cached response; else miss → call upstream → write `(embedding, response)`.
+  The prompt is embedded **once per request, off the event loop** (`run_in_threadpool`), and the vector
+  is reused for the read and the write — the CPU-bound embed never blocks the async loop, and a miss
+  never embeds twice.
 - **Scope** = `(model alias, output-affecting params: temperature/top_p/max_tokens/stop/n/seed)`, so a
   response is never shared across params that would change the answer. Shared across tenants by default
   for hit rate (`cache_per_tenant=true` isolates per tenant).

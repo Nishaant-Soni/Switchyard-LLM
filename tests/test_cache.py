@@ -48,33 +48,43 @@ def _unit_at_cosine(c):
     return [c, float(np.sqrt(1 - c * c))]  # unit-ish vector whose cosine with [1,0] is c
 
 
+# get/set take a precomputed vector; these embed the text first (mirrors the pipeline, which
+# embeds once via cache.embed_query and reuses the vector across the read and write).
+def _set(cache, scope, text, response):
+    cache.set(scope, cache.embed_query(text), response)
+
+
+def _get(cache, scope, text):
+    return cache.get(scope, cache.embed_query(text))
+
+
 # --- store: hits / misses ----------------------------------------------------------------
 def test_exact_and_paraphrase_hit():
     emb = FakeEmbedder({"cat": [1.0, 0.0], "cat-para": _unit_at_cosine(0.95)})
     cache = SemanticCache(emb, threshold=THRESHOLD)
-    cache.set("s", "cat", _resp("cat"))
-    assert cache.get("s", "cat").id == "cat"  # exact, cosine 1.0
-    assert cache.get("s", "cat-para").id == "cat"  # paraphrase, cosine 0.95 >= 0.9
+    _set(cache, "s", "cat", _resp("cat"))
+    assert _get(cache, "s", "cat").id == "cat"  # exact, cosine 1.0
+    assert _get(cache, "s", "cat-para").id == "cat"  # paraphrase, cosine 0.95 >= 0.9
 
 
 def test_below_threshold_miss():
     emb = FakeEmbedder({"cat": [1.0, 0.0], "far": _unit_at_cosine(0.85)})
     cache = SemanticCache(emb, threshold=THRESHOLD)
-    cache.set("s", "cat", _resp())
-    assert cache.get("s", "far") is None  # cosine 0.85 < 0.9
+    _set(cache, "s", "cat", _resp())
+    assert _get(cache, "s", "far") is None  # cosine 0.85 < 0.9
 
 
 def test_scope_isolation():
     emb = FakeEmbedder({"cat": [1.0, 0.0]})
     cache = SemanticCache(emb, threshold=THRESHOLD)
-    cache.set("scope-a", "cat", _resp())
-    assert cache.get("scope-a", "cat") is not None
-    assert cache.get("scope-b", "cat") is None  # same prompt, different scope => miss
+    _set(cache, "scope-a", "cat", _resp())
+    assert _get(cache, "scope-a", "cat") is not None
+    assert _get(cache, "scope-b", "cat") is None  # same prompt, different scope => miss
 
 
 def test_empty_scope_miss():
     cache = SemanticCache(FakeEmbedder({"x": [1.0, 0.0]}), threshold=THRESHOLD)
-    assert cache.get("never-written", "x") is None
+    assert _get(cache, "never-written", "x") is None
 
 
 # --- store: TTL + eviction ---------------------------------------------------------------
@@ -83,22 +93,22 @@ def test_ttl_expiry():
     cache = SemanticCache(
         FakeEmbedder({"cat": [1.0, 0.0]}), threshold=THRESHOLD, ttl_s=30, now=clock
     )
-    cache.set("s", "cat", _resp())
-    assert cache.get("s", "cat") is not None
+    _set(cache, "s", "cat", _resp())
+    assert _get(cache, "s", "cat") is not None
     clock.advance(31)
-    assert cache.get("s", "cat") is None  # expired
+    assert _get(cache, "s", "cat") is None  # expired
 
 
 def test_lru_eviction_respects_recency():
     emb = FakeEmbedder({"a": [1.0, 0.0, 0.0], "b": [0.0, 1.0, 0.0], "c": [0.0, 0.0, 1.0]})
     cache = SemanticCache(emb, threshold=THRESHOLD, max_entries=2)
-    cache.set("s", "a", _resp("a"))
-    cache.set("s", "b", _resp("b"))
-    assert cache.get("s", "a").id == "a"  # touch 'a' -> 'b' becomes least-recently-used
-    cache.set("s", "c", _resp("c"))  # over capacity -> evict LRU ('b')
-    assert cache.get("s", "b") is None
-    assert cache.get("s", "a").id == "a"
-    assert cache.get("s", "c").id == "c"
+    _set(cache, "s", "a", _resp("a"))
+    _set(cache, "s", "b", _resp("b"))
+    assert _get(cache, "s", "a").id == "a"  # touch 'a' -> 'b' becomes least-recently-used
+    _set(cache, "s", "c", _resp("c"))  # over capacity -> evict LRU ('b')
+    assert _get(cache, "s", "b") is None
+    assert _get(cache, "s", "a").id == "a"
+    assert _get(cache, "s", "c").id == "c"
 
 
 # --- key builders ------------------------------------------------------------------------
@@ -143,6 +153,6 @@ def test_real_minilm_paraphrase_hit():
         pytest.skip(f"real MiniLM unavailable: {exc}")
 
     cache = SemanticCache(embedder, threshold=0.6)
-    cache.set("s", "How do I reset my password?", _resp("pw"))
-    assert cache.get("s", "What's the way to reset my password?").id == "pw"  # paraphrase
-    assert cache.get("s", "What is the capital of France?") is None  # unrelated
+    _set(cache, "s", "How do I reset my password?", _resp("pw"))
+    assert _get(cache, "s", "What's the way to reset my password?").id == "pw"  # paraphrase
+    assert _get(cache, "s", "What is the capital of France?") is None  # unrelated

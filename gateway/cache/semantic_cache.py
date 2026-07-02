@@ -8,9 +8,12 @@ Design:
   - **TTL**: entries carry an expiry; expired hits are dropped on access.
   - **Max-size LRU eviction**: a global recency order caps total entries across all scopes.
 
-The store is deliberately request-agnostic — `get`/`set` take an opaque `scope` string and the query
-`text`. `build_scope_key`/`build_query_text` derive those from a request; keeping them separate lets
-the pipeline layer (Phase 4 Group 2) decide, e.g., whether to prepend a tenant segment to the scope.
+The store is deliberately request-agnostic — `get`/`set` take an opaque `scope` string and a
+precomputed query **vector**. Embedding is factored out into `embed_query` (the one expensive,
+blocking step) so the caller can run it once, off the event loop, and reuse the vector across a
+read and a subsequent write — a miss then embeds once, not twice. `build_scope_key`/
+`build_query_text` derive the scope/text from a request; keeping them separate lets the pipeline
+layer decide, e.g., whether to prepend a tenant segment to the scope.
 """
 
 import json
@@ -77,11 +80,16 @@ class SemanticCache:
         self._next_id = 0
         self._dim: int | None = None
 
-    def get(self, scope: str, text: str) -> ChatCompletionResponse | None:
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embed one query into a (1, dim) float32 array. This is the cache's only expensive,
+        blocking step (a model forward pass for the real embedder), so callers run it off the
+        event loop and reuse the result across get/set — avoiding a double-embed on a miss."""
+        return np.asarray(self.embedder.embed([text]), dtype="float32")
+
+    def get(self, scope: str, vec: np.ndarray) -> ChatCompletionResponse | None:
         index = self._indexes.get(scope)
         if index is None or index.ntotal == 0:
             return None
-        vec = self._embed_one(text)
         k = min(index.ntotal, 5)
         sims, ids = index.search(vec, k)
         now = self.now()
@@ -101,8 +109,7 @@ class SemanticCache:
             break
         return None
 
-    def set(self, scope: str, text: str, response: ChatCompletionResponse) -> None:
-        vec = self._embed_one(text)
+    def set(self, scope: str, vec: np.ndarray, response: ChatCompletionResponse) -> None:
         if self._dim is None:
             self._dim = vec.shape[1]
         index = self._indexes.get(scope)
@@ -117,9 +124,6 @@ class SemanticCache:
         self._entries[entry_id] = _Entry(scope, response, expires_at)
         self._lru[entry_id] = None
         self._evict_if_needed()
-
-    def _embed_one(self, text: str) -> np.ndarray:
-        return np.asarray(self.embedder.embed([text]), dtype="float32")
 
     def _evict_if_needed(self) -> None:
         while len(self._entries) > self.max_entries:

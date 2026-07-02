@@ -14,6 +14,7 @@ import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, Header, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from gateway.cache.embedder import SentenceTransformerEmbedder
 from gateway.cache.semantic_cache import SemanticCache, build_query_text, build_scope_key
@@ -173,13 +174,15 @@ async def chat_completions(
             resp.headers["Retry-After"] = str(max(1, math.ceil(rl.retry_after_s)))
             return resp
 
-    # Semantic cache read (after admission, before routing). A hit serves with no upstream call.
+    # Semantic cache read (after admission, before the upstream call). A hit serves with no
+    # upstream call. Embedding is the cache's one expensive/blocking step, so it runs off the event
+    # loop *once*; the vector is reused for the write on a miss (no double-embed).
     cache: SemanticCache | None = app.state.cache
-    scope = query_text = None
+    scope = query_vec = None
     if cache is not None:
         scope = _cache_scope(request, tenant)
-        query_text = build_query_text(request)
-        cached = cache.get(scope, query_text)
+        query_vec = await run_in_threadpool(cache.embed_query, build_query_text(request))
+        cached = cache.get(scope, query_vec)
         if cached is not None:
             # Hit: zero upstream tokens -> refund the estimate (request slot stays charged).
             await _refund_tokens(tenant, estimated_tokens)
@@ -210,9 +213,9 @@ async def chat_completions(
     if tenant is not None and result.usage is not None:
         await app.state.limiter.reconcile(tenant, result.usage.total_tokens, estimated_tokens)
 
-    # Cache write on a successful (non-streaming) miss.
+    # Cache write on a successful (non-streaming) miss — reuses the vector embedded for the read.
     if cache is not None:
-        cache.set(scope, query_text, result)
+        cache.set(scope, query_vec, result)
         response.headers["x-switchyard-cache"] = "miss"
 
     response.headers["x-switchyard-provider"] = target.provider
