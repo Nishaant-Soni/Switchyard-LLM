@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phase 3 complete — resilient multi-provider routing **plus per-tenant rate limiting** (Redis token-bucket on request *and* token rate, with tiktoken estimation reconciled against real usage). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phase 3 complete + Phase 4 Group 1 — resilient multi-provider routing, per-tenant rate limiting, and the **semantic-cache component** built & unit-tested (MiniLM + FAISS); pipeline wiring is Phase 4 Group 2. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -209,7 +209,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 1 | Multi-provider registry + priority/weighted routing | ✅ |
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
-| 4 | Semantic cache (the headline) | ☐ |
+| 4 | Semantic cache (the headline) | ◑ Group 1 done — component built + tested (Group 2 = pipeline wiring) |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ☐ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |
 | 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
