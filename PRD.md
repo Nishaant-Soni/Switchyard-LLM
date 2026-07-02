@@ -73,7 +73,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 
 **Request lifecycle (non-streaming):** auth → rate-limit → cache read → route → (breaker-guarded) upstream call with retry/fallback → token reconcile → cost attribution → cache write → metrics → respond.
 
-> **Note — alias validation precedes admission.** Resolving the logical alias to its ordered targets is a cheap, side-effect-free in-memory step, so it runs *before* rate-limit admission: an unknown alias is a client-side `400` that touches no provider and does no billable work, and must not consume any quota. The rest of the lifecycle ordering above is unchanged; only alias *validation* is hoisted ahead of the rate-limit check.
+> **Note — "route" splits into resolution and dispatch.** The single "route" step above is two stages in the code. **Alias resolution/validation** (alias → ordered targets) is a cheap, side-effect-free in-memory lookup, so it runs *up front* — before rate-limit admission *and* before the cache read — which lets an unknown alias return a client-side `400` that touches no provider, does no billable work, and consumes no quota. **Provider dispatch** (the breaker/retry/fallback upstream call) is the expensive stage and stays *after* the cache read, so a cache hit still short-circuits it. So the effective order is: auth → alias resolution → rate-limit → cache read → dispatch → reconcile → cache write → respond.
 
 **Control plane vs. data plane:** routing policies and provider/model config live in YAML loaded at startup (and hot-reloadable as a stretch goal). Live signals consumed by the control plane (per-provider p95 latency, breaker state) are computed from the observability layer — closing the loop so observability is an *input* to routing, not a bolt-on.
 
@@ -101,6 +101,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Tunables:** similarity threshold (precision/recall tradeoff — too loose serves wrong answers, too tight collapses hit rate), TTL, max entries (eviction).
 - **Index:** FAISS (in-process) for the benchmark; Redis-vector as the shared-state alternative for multi-instance.
 - **Streaming:** streaming requests bypass the cache *read* path; on a streaming miss, the assembled full response may be written to cache for future non-streaming hits (stretch).
+- **Rate-limit interaction:** the cache read sits *after* rate-limit admission, so a request slot is still charged (duplicate-prompt spam can't bypass throttling), but a **cache hit refunds the token estimate** back to ~0 — a hit consumes no upstream tokens, so the tenant's token budget (= real upstream cost) is restored, making the cache's cost savings visible in the limiter itself.
 - **Why it matters:** this produces the resume number (cost ↓, p95 ↓ at a measured hit rate). Owning the threshold-tuning story carries an entire interview.
 
 ### 7.4 Rate limiting
@@ -108,6 +109,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - Algorithm: token-bucket *or* sliding-window-counter (document the choice and tradeoff).
 - **Two-dimensional:** limit on request rate *and* on token rate, because LLM cost is token-denominated and **token limits often bind before request limits** (e.g. a provider allowing ~1,000 req/day but only ~100K tokens/day caps you at ~100 calls/day for 1K-token calls).
 - **Token accounting:** estimate tokens pre-call (heuristic / `tiktoken` approximation) for the admission check, then **reconcile** against the provider's actual `usage` in the response. Pre/post reconciliation is a deliberate depth point.
+- **Refund on no-token outcomes:** reconcile-against-actual generalizes to failures — when a request produces zero upstream tokens (every target failed, a non-retryable provider error, or a cache hit), the charged token estimate is **refunded** (reconciled against 0). The **request slot stays charged** whenever a real upstream attempt was made, so retrying a dead route is still throttled by the request-rate limit. (An unknown alias is rejected before admission, so it is never charged in the first place.)
 - **Why it matters:** token-bucket vs. sliding-window is a classic distributed-systems question; doing it per-tenant in shared state is the realistic version.
 
 ### 7.5 Resilience
@@ -156,6 +158,7 @@ The headline number must be **reproducible and honestly scoped**, because the ca
 A real gateway earns its keep by normalizing provider differences. Documented quirks to handle:
 
 - **Gemini streaming usage:** Gemini's OpenAI-compatible streaming has been observed to return `usage` in **every** chunk rather than only the final chunk (which violates the OpenAI spec where usage appears optionally only in the last chunk). Naive OpenAI-compliant accounting double-counts and can massively inflate reported tokens. The Gemini adapter must take usage only from the final chunk (or de-duplicate) so cost attribution stays correct.
+- **Gemini reasoning tokens:** Gemini 3 Flash is a *reasoning* model — it spends tokens on internal "thinking" before any visible output. Two consequences: (a) with a small `max_tokens` the whole budget can be consumed by thinking, yielding `content=None` + `finish_reason=length` + `completion_tokens=0` (give reasoning models token headroom); (b) `usage.total_tokens` **includes the hidden reasoning tokens** and exceeds `prompt_tokens + completion_tokens`. Token reconciliation (§7.4) therefore reconciles against `total_tokens`, and cost attribution (§7.7) must price the reasoning tokens, so reasoning-heavy models are charged for what they actually consumed.
 - **Auth schemes differ:** Bearer token vs. key param vs. header name — normalized in the adapter.
 - **Param support differs:** some providers ignore or reject certain OpenAI params (`n`, `logprobs`, reasoning controls); the adapter strips/maps unsupported params and records when it does.
 - **Free-tier 429s are normal, not exceptional:** the fallback chain is the intended handler for quota exhaustion, not an error path.
