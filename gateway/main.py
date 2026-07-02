@@ -1,8 +1,9 @@
-"""Switchyard LLM Gateway — Phase 3 (Group 1): per-tenant rate limiting.
+"""Switchyard LLM Gateway.
 
-Request pipeline: auth (API key -> tenant) -> rate-limit admission (Redis token-bucket on request
-rate AND token rate) -> routing -> resilient execution. Rate limiting is active only when tenants
-are configured in config/tenants.yaml; otherwise the gateway runs open (no Redis needed).
+Request pipeline (non-streaming): auth (API key -> tenant) -> alias validation -> rate-limit
+admission (Redis token-bucket on request rate AND token rate) -> semantic-cache read -> resilient
+execution -> cache write. Rate limiting is active only when tenants are configured; the semantic
+cache is active when cache_enabled (both degrade gracefully when off).
 """
 
 import logging
@@ -14,6 +15,8 @@ import redis.asyncio as redis
 from fastapi import FastAPI, Header, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from gateway.cache.embedder import SentenceTransformerEmbedder
+from gateway.cache.semantic_cache import SemanticCache, build_query_text, build_scope_key
 from gateway.config import get_settings
 from gateway.providers.base import UpstreamError
 from gateway.providers.registry import ProviderRegistry
@@ -48,6 +51,24 @@ async def lifespan(app: FastAPI):
         logger.info("rate limiting ENABLED (redis=%s)", settings.redis_url)
     else:
         logger.info("rate limiting disabled (no tenants configured)")
+
+    app.state.cache = None
+    app.state.cache_per_tenant = settings.cache_per_tenant
+    if settings.cache_enabled:
+        app.state.cache = SemanticCache(
+            SentenceTransformerEmbedder(),
+            threshold=settings.cache_similarity_threshold,
+            ttl_s=settings.cache_ttl_s,
+            max_entries=settings.cache_max_entries,
+        )
+        logger.info(
+            "semantic cache ENABLED (threshold=%s, ttl_s=%s, per_tenant=%s)",
+            settings.cache_similarity_threshold,
+            settings.cache_ttl_s,
+            settings.cache_per_tenant,
+        )
+    else:
+        logger.info("semantic cache disabled")
 
     logger.info(
         "gateway ready: providers=%s aliases=%s",
@@ -89,6 +110,15 @@ async def _refund_tokens(tenant: Tenant | None, estimated_tokens: int) -> None:
     admission, so it is never charged and never reaches here.)"""
     if tenant is not None:
         await app.state.limiter.reconcile(tenant, 0, estimated_tokens)
+
+
+def _cache_scope(request: ChatCompletionRequest, tenant: Tenant | None) -> str:
+    """Cache scope = model alias + output-affecting params. Shared across tenants by default;
+    prepend the tenant id when per-tenant isolation is configured."""
+    scope = build_scope_key(request)
+    if app.state.cache_per_tenant and tenant is not None:
+        scope = f"{tenant.id}\x1f{scope}"
+    return scope
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -143,6 +173,20 @@ async def chat_completions(
             resp.headers["Retry-After"] = str(max(1, math.ceil(rl.retry_after_s)))
             return resp
 
+    # Semantic cache read (after admission, before routing). A hit serves with no upstream call.
+    cache: SemanticCache | None = app.state.cache
+    scope = query_text = None
+    if cache is not None:
+        scope = _cache_scope(request, tenant)
+        query_text = build_query_text(request)
+        cached = cache.get(scope, query_text)
+        if cached is not None:
+            # Hit: zero upstream tokens -> refund the estimate (request slot stays charged).
+            await _refund_tokens(tenant, estimated_tokens)
+            logger.info("cache HIT alias=%s", request.model)
+            response.headers["x-switchyard-cache"] = "hit"
+            return cached
+
     try:
         result, target = await executor.execute(targets, registry, request)
     except UpstreamError as exc:
@@ -162,9 +206,14 @@ async def chat_completions(
             "all_targets_failed",
         )
 
-    # Reconcile the token bucket against actual usage (Group 2): admission charged the estimate.
+    # Reconcile the token bucket against actual usage: admission charged the estimate.
     if tenant is not None and result.usage is not None:
         await app.state.limiter.reconcile(tenant, result.usage.total_tokens, estimated_tokens)
+
+    # Cache write on a successful (non-streaming) miss.
+    if cache is not None:
+        cache.set(scope, query_text, result)
+        response.headers["x-switchyard-cache"] = "miss"
 
     response.headers["x-switchyard-provider"] = target.provider
     response.headers["x-switchyard-model"] = target.model

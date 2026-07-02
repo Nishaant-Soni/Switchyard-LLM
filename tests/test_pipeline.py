@@ -13,11 +13,14 @@ fakeredis client the endpoint uses and the post-request assertions share that lo
 """
 
 import asyncio
+import hashlib
 
 import fakeredis.aioredis
 import httpx
+import numpy as np
 
 from gateway import main
+from gateway.cache.semantic_cache import SemanticCache
 from gateway.providers.base import UpstreamError
 from gateway.ratelimit.limiter import RateLimiter
 from gateway.resilience.circuit_breaker import BreakerRegistry
@@ -48,8 +51,10 @@ def _ok_response(total_tokens=2):
 class _FakeAdapter:
     def __init__(self, behavior):
         self.behavior = behavior
+        self.calls = 0
 
     async def chat_completion(self, request):
+        self.calls += 1
         if isinstance(self.behavior, Exception):
             raise self.behavior
         return self.behavior
@@ -67,7 +72,7 @@ async def _no_sleep(_):
     return None
 
 
-def _install_state(behavior):
+def _install_state(behavior, cache=None, cache_per_tenant=False):
     """Wire main.app.state with hermetic fakes; returns the fakeredis client so a test can read
     bucket levels on the same event loop afterward."""
     client = fakeredis.aioredis.FakeRedis()
@@ -79,6 +84,8 @@ def _install_state(behavior):
     main.app.state.executor = ResilientExecutor(
         main.app.state.breakers, base_delay_s=0.0, sleep=_no_sleep
     )
+    main.app.state.cache = cache
+    main.app.state.cache_per_tenant = cache_per_tenant
     return client
 
 
@@ -90,6 +97,10 @@ async def _post(json, headers):
 
 async def _tokens(client):
     return float(await client.hget("rl:t1:tok", "tokens"))
+
+
+async def _requests(client):
+    return float(await client.hget("rl:t1:req", "tokens"))
 
 
 def test_success_reconciles_against_actual_usage():
@@ -160,3 +171,52 @@ def test_streaming_rejected_without_charging_tokens():
     status, tok, req = asyncio.run(run())
     assert status == 501
     assert tok is None and req is None  # admission never ran => no buckets created
+
+
+class _HashEmbedder:
+    """Deterministic, real-embedder-free: identical text -> identical (centered) vector -> cosine
+    1.0 (hit); different text -> ~orthogonal -> low cosine (miss). Keeps cache pipeline tests
+    hermetic (no torch/MiniLM)."""
+
+    def embed(self, texts):
+        rows = []
+        for t in texts:
+            digest = hashlib.sha256(t.encode()).digest()[:16]
+            rows.append(np.frombuffer(digest, dtype="uint8").astype("float32") - 128.0)
+        arr = np.array(rows, dtype="float32")
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return arr / norms
+
+
+def test_cache_hit_serves_from_cache_and_refunds_tokens():
+    async def run():
+        cache = SemanticCache(_HashEmbedder(), threshold=0.9)
+        client = _install_state(_ok_response(total_tokens=2), cache=cache)
+        r1 = await _post(_REQ, _AUTH)  # miss -> upstream -> write
+        r2 = await _post(_REQ, _AUTH)  # identical -> hit -> served from cache
+        adapter = main.app.state.registry.get("groq")
+        return r1, r2, adapter.calls, await _tokens(client), await _requests(client)
+
+    r1, r2, calls, tokens, requests = asyncio.run(run())
+    assert r1.status_code == 200 and r1.headers["x-switchyard-cache"] == "miss"
+    assert r2.status_code == 200 and r2.headers["x-switchyard-cache"] == "hit"
+    assert calls == 1  # second request never hit the provider
+    assert tokens == TOKENS_PER_MIN - 2  # only the miss's actual usage; the hit was refunded
+    assert requests == REQUESTS_PER_MIN - 2  # both requests still cost a request slot
+
+
+def test_cache_miss_marks_header_and_populates():
+    async def run():
+        cache = SemanticCache(_HashEmbedder(), threshold=0.9)
+        _install_state(_ok_response(), cache=cache)
+        resp = await _post(_REQ, _AUTH)
+        # a *different* prompt in the same scope must not hit the first entry
+        other = await _post(
+            {**_REQ, "messages": [{"role": "user", "content": "totally different"}]}, _AUTH
+        )
+        return resp, other
+
+    resp, other = asyncio.run(run())
+    assert resp.headers["x-switchyard-cache"] == "miss"
+    assert other.headers["x-switchyard-cache"] == "miss"  # distinct prompt => not a false hit
