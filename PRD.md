@@ -73,6 +73,8 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 
 **Request lifecycle (non-streaming):** auth → rate-limit → cache read → route → (breaker-guarded) upstream call with retry/fallback → token reconcile → cost attribution → cache write → metrics → respond.
 
+> **Note — alias validation precedes admission.** Resolving the logical alias to its ordered targets is a cheap, side-effect-free in-memory step, so it runs *before* rate-limit admission: an unknown alias is a client-side `400` that touches no provider and does no billable work, and must not consume any quota. The rest of the lifecycle ordering above is unchanged; only alias *validation* is hoisted ahead of the rate-limit check.
+
 **Control plane vs. data plane:** routing policies and provider/model config live in YAML loaded at startup (and hot-reloadable as a stretch goal). Live signals consumed by the control plane (per-provider p95 latency, breaker state) are computed from the observability layer — closing the loop so observability is an *input* to routing, not a bolt-on.
 
 ## 7. Component specifications

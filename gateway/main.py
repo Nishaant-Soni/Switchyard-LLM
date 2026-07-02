@@ -23,7 +23,7 @@ from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.router import Router
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
-from gateway.tenancy.auth import TenantRegistry, extract_bearer
+from gateway.tenancy.auth import Tenant, TenantRegistry, extract_bearer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway")
@@ -81,24 +81,57 @@ def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
     )
 
 
+async def _refund_tokens(tenant: Tenant | None, estimated_tokens: int) -> None:
+    """Refund tokens charged at admission for a request whose upstream attempt produced nothing
+    (a non-retryable provider error, or every target failing): actual usage was 0, so reconcile
+    against zero. The request slot stays charged — a real upstream attempt was made, so request-rate
+    limiting still throttles a client retrying a dead route. (An unknown alias is validated before
+    admission, so it is never charged and never reaches here.)"""
+    if tenant is not None:
+        await app.state.limiter.reconcile(tenant, 0, estimated_tokens)
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
     response: Response,
     authorization: str | None = Header(default=None),
 ):
+    tenants: TenantRegistry = app.state.tenants
+    tenant = None
+    estimated_tokens = 0
+
+    # Auth first — even a request we won't serve (e.g. streaming) must present a valid key.
+    if tenants.enabled:
+        tenant = tenants.resolve(extract_bearer(authorization))
+        if tenant is None:
+            return _error(401, "Invalid or missing API key.", "invalid_api_key")
+
+    # Streaming isn't served until Phase 5. Reject after auth but before rate-limit admission,
+    # so a request we don't serve never consumes the tenant's token budget.
     if request.stream:
         return _error(
             501, "Streaming is not supported yet (arrives in Phase 5).", "not_implemented"
         )
 
-    tenants: TenantRegistry = app.state.tenants
-    tenant = None
-    estimated_tokens = 0
-    if tenants.enabled:
-        tenant = tenants.resolve(extract_bearer(authorization))
-        if tenant is None:
-            return _error(401, "Invalid or missing API key.", "invalid_api_key")
+    router: Router = app.state.router
+    registry: ProviderRegistry = app.state.registry
+    executor: ResilientExecutor = app.state.executor
+
+    # Validate the alias BEFORE rate-limit admission: an unknown alias is a client-side validation
+    # error (400) that does no billable work and never reaches a provider, so it must not consume
+    # any quota (no charge, not a charge-then-refund).
+    try:
+        targets = router.resolve(request.model)
+    except KeyError:
+        return _error(
+            400,
+            f"Unknown model alias {request.model!r}. Known aliases: {router.aliases()}.",
+            "invalid_request_error",
+        )
+
+    # Rate-limit admission: charge the pre-call token estimate against both buckets.
+    if tenant is not None:
         estimated_tokens = estimate_tokens(request)
         rl = await app.state.limiter.check(tenant, estimated_tokens)
         if not rl.allowed:
@@ -110,25 +143,15 @@ async def chat_completions(
             resp.headers["Retry-After"] = str(max(1, math.ceil(rl.retry_after_s)))
             return resp
 
-    router: Router = app.state.router
-    registry: ProviderRegistry = app.state.registry
-    executor: ResilientExecutor = app.state.executor
-
-    try:
-        targets = router.resolve(request.model)
-    except KeyError:
-        return _error(
-            400,
-            f"Unknown model alias {request.model!r}. Known aliases: {router.aliases()}.",
-            "invalid_request_error",
-        )
-
     try:
         result, target = await executor.execute(targets, registry, request)
     except UpstreamError as exc:
-        # Non-retryable client error (e.g. 400/401) forwarded verbatim.
+        # An upstream attempt was made but returned a non-retryable client error (forwarded
+        # verbatim). Keep the request slot charged (an attempt happened), refund the tokens.
+        await _refund_tokens(tenant, estimated_tokens)
         return JSONResponse(status_code=exc.status_code, content=exc.body)
     except AllTargetsFailed as exc:
+        await _refund_tokens(tenant, estimated_tokens)
         last = exc.last_error
         if isinstance(last, UpstreamError):
             # e.g. every target rate-limited -> forward the last upstream status/body.

@@ -70,6 +70,11 @@ All four expose an OpenAI-compatible `chat/completions` surface, keeping the ada
                               └───────────┘
 ```
 
+The numbered steps are the target lifecycle. One refinement in the current code: **alias validation
+runs before rate-limit admission** — resolving an alias to its targets is a cheap, side-effect-free
+step, so an unknown alias returns `400` before any quota is charged (rather than charge-then-refund).
+The rest of the ordering is as shown.
+
 **Control plane vs. data plane:** routing policies and provider/model config live in YAML loaded
 at startup. Live signals (per-provider p95 latency, breaker state) computed by the observability
 layer feed the latency-/cost-aware policies — so observability is an *input* to routing, not a bolt-on.
@@ -158,6 +163,14 @@ tenants:
   charge if under). tiktoken is an approximation for non-OpenAI tokenizers — reconciliation makes it
   exact. (First rate-limited request lazily downloads the tiktoken vocab; it falls back to a
   heuristic if offline.)
+- **Accounting on non-success paths** follows one rule — *charge a request slot iff a real upstream
+  attempt was made:*
+  - **Unknown alias** (`400`) is validated *before* admission, and a rejected **streaming** request
+    (`501`) is rejected before admission too — both charge **nothing** (auth still runs first, so a
+    bad key is `401` either way).
+  - When an upstream attempt *was* made but produced nothing (every target fails, or a non-retryable
+    provider `4xx`), the token estimate is **refunded** (actual usage was 0) but the **request slot
+    stays charged** — so retrying a dead route is still throttled by the request-rate limit.
 
 Bring up Redis with the stack via `docker compose up`, or run it standalone
 (`docker run -p 6379:6379 redis:7-alpine`) for local dev.
