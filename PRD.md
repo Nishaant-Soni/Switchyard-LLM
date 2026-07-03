@@ -100,7 +100,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Scoping / correctness:** cache key is scoped by `(model alias, normalized params that affect output)`; responses are not shared across scopes that would change the answer. Optional per-tenant scoping (correctness/privacy vs. hit-rate tradeoff).
 - **Tunables:** similarity threshold (precision/recall tradeoff — too loose serves wrong answers, too tight collapses hit rate), TTL, max entries (eviction).
 - **Index:** FAISS (in-process) for the benchmark; Redis-vector as the shared-state alternative for multi-instance.
-- **Streaming:** streaming requests bypass the cache *read* path; on a streaming miss, the assembled full response may be written to cache for future non-streaming hits (stretch).
+- **Streaming:** streaming requests bypass the cache entirely (read *and* write). Assembling a streamed miss into a cache entry for future non-streaming hits was scoped as a stretch and **not implemented**.
 - **Rate-limit interaction:** the cache read sits *after* rate-limit admission, so a request slot is still charged (duplicate-prompt spam can't bypass throttling), but a **cache hit refunds the token estimate** back to ~0 — a hit consumes no upstream tokens, so the tenant's token budget (= real upstream cost) is restored, making the cache's cost savings visible in the limiter itself.
 - **Why it matters:** this produces the resume number (cost ↓, p95 ↓ at a measured hit rate). Owning the threshold-tuning story carries an entire interview.
 
@@ -109,7 +109,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - Algorithm: token-bucket *or* sliding-window-counter (document the choice and tradeoff).
 - **Two-dimensional:** limit on request rate *and* on token rate, because LLM cost is token-denominated and **token limits often bind before request limits** (e.g. a provider allowing ~1,000 req/day but only ~100K tokens/day caps you at ~100 calls/day for 1K-token calls).
 - **Token accounting:** estimate tokens pre-call (heuristic / `tiktoken` approximation) for the admission check, then **reconcile** against the provider's actual `usage` in the response. Pre/post reconciliation is a deliberate depth point.
-- **Refund on no-token outcomes:** reconcile-against-actual generalizes to failures — when a request produces zero upstream tokens (every target failed, a non-retryable provider error, or a cache hit), the charged token estimate is **refunded** (reconciled against 0). The **request slot stays charged** whenever a real upstream attempt was made, so retrying a dead route is still throttled by the request-rate limit. (An unknown alias is rejected before admission, so it is never charged in the first place.)
+- **Refund on no-token outcomes:** reconcile-against-actual generalizes to failures — when a request produces no usable, accounted usage (every target failed, a non-retryable provider error, a cache hit, or a stream that errors/disconnects before its final `usage` chunk), the charged token estimate is **refunded** (reconciled against 0). A stream that *completes* reconciles against the final chunk's `usage` as normal. The **request slot stays charged** whenever a real upstream attempt was made, so retrying a dead route is still throttled by the request-rate limit. (An unknown alias is rejected before admission, so it is never charged in the first place.)
 - **Why it matters:** token-bucket vs. sliding-window is a classic distributed-systems question; doing it per-tenant in shared state is the realistic version.
 
 ### 7.5 Resilience
@@ -118,11 +118,12 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Timeout budget:** per-attempt and per-request deadlines so a slow provider can't stall the whole request.
 - **Why it matters:** this is the resilience vocabulary the current resume lacks. Being able to explain the half-open state and why fallback is cross-provider is staff-level signal.
 
-### 7.6 SSE streaming passthrough
-- Upstream streamed with `httpx` streaming; forwarded to the client via FastAPI `StreamingResponse` as an async generator, chunk by chunk.
-- **Backpressure** is handled naturally by async iteration (a slow client throttles the upstream read).
+### 7.6 SSE streaming
+- Upstream streamed with `httpx` streaming; each chunk is **parsed → normalized → re-emitted** to the client via FastAPI `StreamingResponse` as an async generator (not raw byte passthrough — parsing is needed to tap the final `usage` and to fix Gemini's per-chunk usage, so the outbound stream is uniformly spec-conformant regardless of backend).
+- **Backpressure** is handled naturally by async iteration (a slow client throttles the upstream read). The upstream generator is closed when the response ends, so its connection is released promptly even on a mid-stream client disconnect.
+- **Resilience up to first byte:** the executor peeks the first chunk of each target, so a pre-first-byte failure is a breaker-guarded **cross-provider fallback** (advance to the next target) and surfaces as a proper error *status*, not a broken `200`. Once the first chunk is forwarded the choice is **committed** — a later mid-stream error surfaces to the client (bytes are already on the wire) and is not retried.
 - Streaming complicates caching (bypass read) and token accounting (usage arrives at the end via `stream_options: {include_usage: true}`), so it is treated as a distinct path.
-- **Why it matters:** demonstrating *why* streaming complicates the rest of the system is the signal.
+- **Why it matters:** demonstrating *why* streaming complicates the rest of the system — and still giving it fallback up to first byte — is the signal.
 
 ### 7.7 Observability
 - `prometheus_client` exposes: latency histograms (per provider, p50/p95/p99), counters (requests, cache hits/misses, errors by type, tokens in/out), and cost gauges per tenant.
