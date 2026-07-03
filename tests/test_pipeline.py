@@ -5,7 +5,7 @@ Covers the rate-limit accounting rules wired in Phase 3 iteration 7:
   2. Token refund when an upstream attempt produces nothing (non-retryable upstream error or all
      targets failed) — actual usage is 0, so tokens are refunded while the request slot stays
      charged (a real attempt was made).
-  3. Auth runs before the streaming 501, and a rejected streaming request is never charged.
+  3. Streaming still requires auth (bad key → 401 before the stream opens).
 
 Everything runs hermetically over an in-process ASGI transport with fakeredis + fake provider
 adapters (no real Redis/providers). Each test runs on a single event loop via asyncio.run, so the
@@ -151,26 +151,15 @@ def test_non_retryable_upstream_error_refunds_tokens():
     assert tokens == TOKENS_PER_MIN
 
 
-def test_streaming_requires_auth_before_rejection():
+def test_streaming_still_requires_auth():
+    # Streaming is served as of Phase 5, but auth still runs first: a bad key is 401 before the
+    # stream opens. (Streaming success/accounting is covered end-to-end in tests/test_streaming.py.)
     async def run():
         _install_state(_ok_response())
         resp = await _post({**_REQ, "stream": True}, {"Authorization": "Bearer wrong"})
         return resp.status_code
 
-    assert asyncio.run(run()) == 401  # auth runs before the streaming 501
-
-
-def test_streaming_rejected_without_charging_tokens():
-    async def run():
-        client = _install_state(_ok_response())
-        resp = await _post({**_REQ, "stream": True}, _AUTH)
-        tok = await client.hget("rl:t1:tok", "tokens")
-        req = await client.hget("rl:t1:req", "tokens")
-        return resp.status_code, tok, req
-
-    status, tok, req = asyncio.run(run())
-    assert status == 501
-    assert tok is None and req is None  # admission never ran => no buckets created
+    assert asyncio.run(run()) == 401
 
 
 class _HashEmbedder:

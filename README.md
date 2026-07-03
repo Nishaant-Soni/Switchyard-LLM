@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phases 0–4 complete — resilient multi-provider routing, per-tenant rate limiting, and a **semantic cache** wired into the request path (paraphrase → cache hit, no upstream call). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phases 0–4 complete + Phase 5 Group 1 — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, and **SSE streaming** (token-by-token, with post-stream usage accounting). Streaming resilience (fallback up to first byte) is Phase 5 Group 2. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -107,8 +107,8 @@ print(client.chat.completions.create(
 PY
 ```
 
-Endpoints: `POST /v1/chat/completions`, `GET /healthz`, `GET /metrics` (stub until Phase 6).
-Streaming returns `501` until Phase 5. Unknown aliases return `400`.
+Endpoints: `POST /v1/chat/completions` (streaming + non-streaming), `GET /healthz`, `GET /metrics`
+(stub until Phase 6). Send `"stream": true` for token-by-token SSE. Unknown aliases return `400`.
 
 ### Configuring the fleet & routing
 
@@ -203,6 +203,20 @@ Near-duplicate prompts are served from an in-process cache instead of re-hitting
 Bring up Redis with the stack via `docker compose up`, or run it standalone
 (`docker run -p 6379:6379 redis:7-alpine`) for local dev.
 
+### Streaming (SSE)
+
+Send `"stream": true` for a token-by-token `text/event-stream` response (backpressure is natural —
+a slow client throttles the upstream read):
+
+- The gateway **parses, normalizes, and re-emits** every chunk, so output is spec-conformant
+  regardless of backend quirks — e.g. Gemini emits `usage` in *every* chunk; the gateway keeps it
+  only on the final one.
+- **Post-stream accounting:** `stream_options.include_usage` is requested upstream; token
+  reconciliation runs when the stream finishes (refund on a mid-stream error/disconnect).
+- Streaming **bypasses the cache** but still passes auth + rate-limit admission.
+- A stream that fails to open returns a proper error status (the first chunk is peeked before
+  committing to `200`). Cross-provider fallback *up to first byte* is Phase 5 Group 2.
+
 ## Development & tests
 
 ```bash
@@ -238,7 +252,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
 | 4 | Semantic cache (the headline) | ✅ |
-| 5 | SSE streaming passthrough (+ Gemini usage normalization) | ☐ |
+| 5 | SSE streaming passthrough (+ Gemini usage normalization) | ◑ Group 1 done (Group 2 = fallback up to first byte) |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |
 | 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |

@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, Header, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from gateway.cache.embedder import SentenceTransformerEmbedder
@@ -27,6 +27,7 @@ from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.router import Router
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
+from gateway.streaming.sse import stream_sse
 from gateway.tenancy.auth import Tenant, TenantRegistry, extract_bearer
 
 logging.basicConfig(level=logging.INFO)
@@ -122,6 +123,65 @@ def _cache_scope(request: ChatCompletionRequest, tenant: Tenant | None) -> str:
     return scope
 
 
+async def _streaming_completion(
+    request: ChatCompletionRequest,
+    targets: list,
+    registry: ProviderRegistry,
+    tenant: Tenant | None,
+    estimated_tokens: int,
+) -> Response:
+    """Open the upstream stream for the first target and return a `StreamingResponse`. The first
+    chunk is peeked here so a pre-first-byte failure returns a proper error status (not a broken
+    200); token reconciliation runs when the stream finishes (see `on_finish`)."""
+    target = targets[0]  # Group 1: single target. Fallback up to first byte = Group 2.
+    adapter = registry.get(target.provider)
+    if adapter is None:
+        await _refund_tokens(tenant, estimated_tokens)
+        return _error(
+            503,
+            f"Provider {target.provider!r} for alias {request.model!r} is not configured "
+            "(missing API key?).",
+            "provider_unavailable",
+        )
+
+    upstream = request.model_copy(update={"model": target.model})
+    chunks = adapter.stream_chat_completion(upstream)
+    try:
+        first = await chunks.__anext__()  # triggers the upstream open; may raise before first byte
+    except StopAsyncIteration:
+        first = None  # empty stream
+    except UpstreamError as exc:
+        await _refund_tokens(tenant, estimated_tokens)
+        return JSONResponse(status_code=exc.status_code, content=exc.body)
+    except httpx.RequestError as exc:
+        await _refund_tokens(tenant, estimated_tokens)
+        return _error(502, f"Upstream stream failed: {exc}", "upstream_error")
+
+    async def on_finish(usage: dict | None, completed: bool) -> None:
+        if tenant is None:
+            return
+        total = usage.get("total_tokens") if usage else None
+        if completed and total is not None:
+            await app.state.limiter.reconcile(tenant, total, estimated_tokens)
+        elif not completed:
+            # Errored / disconnected before a final usage -> refund (produced nothing complete).
+            await _refund_tokens(tenant, estimated_tokens)
+        # completed but no usage reported -> leave the estimate (don't hand out free tokens).
+
+    logger.info(
+        "stream alias=%s provider=%s model=%s", request.model, target.provider, target.model
+    )
+    return StreamingResponse(
+        stream_sse(first, chunks, on_finish),
+        media_type="text/event-stream",
+        headers={
+            "x-switchyard-provider": target.provider,
+            "x-switchyard-model": target.model,
+            "x-switchyard-cache": "bypass",
+        },
+    )
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -132,18 +192,11 @@ async def chat_completions(
     tenant = None
     estimated_tokens = 0
 
-    # Auth first — even a request we won't serve (e.g. streaming) must present a valid key.
+    # Auth first — even a request we may not serve must present a valid key.
     if tenants.enabled:
         tenant = tenants.resolve(extract_bearer(authorization))
         if tenant is None:
             return _error(401, "Invalid or missing API key.", "invalid_api_key")
-
-    # Streaming isn't served until Phase 5. Reject after auth but before rate-limit admission,
-    # so a request we don't serve never consumes the tenant's token budget.
-    if request.stream:
-        return _error(
-            501, "Streaming is not supported yet (arrives in Phase 5).", "not_implemented"
-        )
 
     router: Router = app.state.router
     registry: ProviderRegistry = app.state.registry
@@ -173,6 +226,11 @@ async def chat_completions(
             )
             resp.headers["Retry-After"] = str(max(1, math.ceil(rl.retry_after_s)))
             return resp
+
+    # Streaming bypasses the cache and streams chunks straight through. Group 1 = single target;
+    # breaker + cross-provider fallback up to first byte lands in Group 2.
+    if request.stream:
+        return await _streaming_completion(request, targets, registry, tenant, estimated_tokens)
 
     # Semantic cache read (after admission, before the upstream call). A hit serves with no
     # upstream call. Embedding is the cache's one expensive/blocking step, so it runs off the event

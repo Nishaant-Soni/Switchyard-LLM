@@ -2,6 +2,7 @@
 Chat Completions request into an upstream call and normalize the response back."""
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
@@ -23,3 +24,9 @@ class ProviderAdapter(ABC):
 
     @abstractmethod
     async def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse: ...
+
+    @abstractmethod
+    def stream_chat_completion(self, request: ChatCompletionRequest) -> AsyncIterator[dict]:
+        """Async-generator yielding parsed SSE chunk dicts. Raises UpstreamError before the first
+        chunk on a non-2xx open (so callers can fall back up to first byte)."""
+        ...
