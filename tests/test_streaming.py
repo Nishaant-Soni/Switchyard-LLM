@@ -333,3 +333,38 @@ def test_streaming_endpoint_forwards_chunks_and_reconciles_tokens():
     body = resp.text
     assert "Hel" in body and "lo" in body and "data: [DONE]" in body
     assert tok == 1000 - 5  # admission charged the estimate; reconciled to actual total_tokens=5
+
+
+def test_streaming_endpoint_refunds_tokens_when_all_targets_fail():
+    # Pre-first-byte failure on a streaming request: the peek surfaces a proper error status (not a
+    # broken 200), and the charged estimate is refunded (nothing was produced).
+    async def run():
+        redis_client = fakeredis.aioredis.FakeRedis()
+        main.app.state.tenants = TenantRegistry({"k1": Tenant("t1", 100, 1000)})
+        main.app.state.limiter = RateLimiter(redis_client, window_s=60, now=lambda: 1000.0)
+        main.app.state.router = Router({"fast": ("priority", [Target("groq", "m")])})
+        main.app.state.registry = _Registry(
+            {"groq": _StreamAdapter(error=UpstreamError(503, {"error": "down"}))}
+        )
+        main.app.state.breakers = BreakerRegistry()
+        main.app.state.executor = ResilientExecutor(main.app.state.breakers, base_delay_s=0.0)
+        main.app.state.cache = None
+        main.app.state.cache_per_tenant = False
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "fast",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"Authorization": "Bearer k1"},
+            )
+        tok = float(await redis_client.hget("rl:t1:tok", "tokens"))
+        return resp, tok
+
+    resp, tok = asyncio.run(run())
+    assert resp.status_code == 503  # last upstream status forwarded, not a streamed 200
+    assert tok == 1000  # estimate charged at admission, then fully refunded

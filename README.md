@@ -212,7 +212,9 @@ a slow client throttles the upstream read):
   regardless of backend quirks — e.g. Gemini emits `usage` in *every* chunk; the gateway keeps it
   only on the final one.
 - **Post-stream accounting:** `stream_options.include_usage` is requested upstream; token
-  reconciliation runs when the stream finishes (refund on a mid-stream error/disconnect).
+  reconciliation runs when the stream finishes (refund on a mid-stream error/disconnect). The
+  upstream generator is closed on the way out, so its httpx connection is released promptly when a
+  client disconnects mid-stream.
 - Streaming **bypasses the cache** but still passes auth + rate-limit admission.
 - A stream that fails to open returns a proper error status (the first chunk is peeked before
   committing to `200`), and it **falls back cross-provider up to first byte** — a dead primary is

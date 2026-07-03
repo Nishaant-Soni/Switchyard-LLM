@@ -25,6 +25,7 @@ from gateway.ratelimit.estimate import estimate_tokens
 from gateway.ratelimit.limiter import RateLimiter
 from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
+from gateway.routing.policies import Target
 from gateway.routing.router import Router
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
 from gateway.streaming.sse import stream_sse
@@ -125,7 +126,7 @@ def _cache_scope(request: ChatCompletionRequest, tenant: Tenant | None) -> str:
 
 async def _streaming_completion(
     request: ChatCompletionRequest,
-    targets: list,
+    targets: list[Target],
     registry: ProviderRegistry,
     tenant: Tenant | None,
     estimated_tokens: int,
