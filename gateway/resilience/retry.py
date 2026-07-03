@@ -9,7 +9,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import httpx
 
@@ -130,5 +130,87 @@ class ResilientExecutor:
                 breaker.record_success()
                 logger.info("served by provider=%s model=%s", target.provider, target.model)
                 return resp, target
+
+        raise AllTargetsFailed(last_error)
+
+    async def execute_stream(
+        self,
+        targets: list[Target],
+        registry: ProviderRegistry,
+        request: ChatCompletionRequest,
+    ) -> tuple[dict | None, AsyncIterator[dict], Target]:
+        """Open a stream over the targets with breaker + fallback **up to first byte**. Returns
+        (first_chunk_or_None, remaining_chunk_iterator, served_target). Once the first chunk is
+        returned the choice is committed: a later mid-stream error surfaces to the client (bytes are
+        already sent), not retried."""
+        start = self.clock()
+        last_error: Exception | None = None
+        attempts = 0
+
+        for target in targets:
+            if self.clock() - start > self.deadline_s:
+                logger.warning("request deadline exceeded before provider=%s", target.provider)
+                break
+
+            adapter: ProviderAdapter | None = registry.get(target.provider)
+            if adapter is None:
+                last_error = UpstreamError(
+                    503,
+                    {
+                        "error": {
+                            "message": f"provider {target.provider!r} not configured",
+                            "type": "provider_unavailable",
+                        }
+                    },
+                )
+                continue
+
+            breaker = self.breakers.get(target.provider)
+            if not breaker.allow():
+                logger.info("skip provider=%s: circuit %s", target.provider, breaker.state.value)
+                last_error = CircuitOpenError(target.provider)
+                continue
+
+            if attempts > 0:
+                delay = self._backoff(attempts)
+                if delay:
+                    await self.sleep(delay)
+            attempts += 1
+
+            upstream = request.model_copy(update={"model": target.model})
+            chunks = adapter.stream_chat_completion(upstream)
+            # __anext__ opens the upstream stream and may raise before the first byte.
+            try:
+                first = await chunks.__anext__()
+            except StopAsyncIteration:
+                breaker.record_success()  # opened fine, just no content
+                logger.info(
+                    "streaming via provider=%s model=%s (empty)", target.provider, target.model
+                )
+                return None, chunks, target
+            except UpstreamError as exc:
+                if _is_retryable_status(exc.status_code):
+                    breaker.record_failure()
+                    last_error = exc
+                    logger.info(
+                        "stream open provider=%s status=%s -> fallback",
+                        target.provider,
+                        exc.status_code,
+                    )
+                    continue
+                # Non-retryable client error: provider healthy, request bad -> surface, no fallback.
+                breaker.record_success()
+                raise
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                breaker.record_failure()
+                last_error = exc
+                logger.info(
+                    "stream open provider=%s transport error -> fallback: %s", target.provider, exc
+                )
+                continue
+            else:
+                breaker.record_success()
+                logger.info("streaming via provider=%s model=%s", target.provider, target.model)
+                return first, chunks, target
 
         raise AllTargetsFailed(last_error)

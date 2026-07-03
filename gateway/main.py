@@ -83,7 +83,7 @@ async def lifespan(app: FastAPI):
         await app.state.redis.aclose()
 
 
-app = FastAPI(title="Switchyard LLM Gateway", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Switchyard LLM Gateway", version="0.5.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -130,32 +130,26 @@ async def _streaming_completion(
     tenant: Tenant | None,
     estimated_tokens: int,
 ) -> Response:
-    """Open the upstream stream for the first target and return a `StreamingResponse`. The first
-    chunk is peeked here so a pre-first-byte failure returns a proper error status (not a broken
+    """Stream a completion with breaker + cross-provider fallback up to first byte. The executor
+    peeks the first chunk, so a pre-first-byte failure returns a proper error status (not a broken
     200); token reconciliation runs when the stream finishes (see `on_finish`)."""
-    target = targets[0]  # Group 1: single target. Fallback up to first byte = Group 2.
-    adapter = registry.get(target.provider)
-    if adapter is None:
-        await _refund_tokens(tenant, estimated_tokens)
-        return _error(
-            503,
-            f"Provider {target.provider!r} for alias {request.model!r} is not configured "
-            "(missing API key?).",
-            "provider_unavailable",
-        )
-
-    upstream = request.model_copy(update={"model": target.model})
-    chunks = adapter.stream_chat_completion(upstream)
+    executor: ResilientExecutor = app.state.executor
     try:
-        first = await chunks.__anext__()  # triggers the upstream open; may raise before first byte
-    except StopAsyncIteration:
-        first = None  # empty stream
+        first, chunks, target = await executor.execute_stream(targets, registry, request)
     except UpstreamError as exc:
+        # Non-retryable client error before first byte, forwarded verbatim.
         await _refund_tokens(tenant, estimated_tokens)
         return JSONResponse(status_code=exc.status_code, content=exc.body)
-    except httpx.RequestError as exc:
+    except AllTargetsFailed as exc:
         await _refund_tokens(tenant, estimated_tokens)
-        return _error(502, f"Upstream stream failed: {exc}", "upstream_error")
+        last = exc.last_error
+        if isinstance(last, UpstreamError):
+            return JSONResponse(status_code=last.status_code, content=last.body)
+        return _error(
+            502,
+            f"All targets failed for alias {request.model!r}: {last}",
+            "all_targets_failed",
+        )
 
     async def on_finish(usage: dict | None, completed: bool) -> None:
         if tenant is None:

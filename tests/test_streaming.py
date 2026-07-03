@@ -17,8 +17,8 @@ from gateway.providers.base import UpstreamError
 from gateway.providers.gemini import GeminiAdapter
 from gateway.providers.openai_compat import OpenAICompatAdapter
 from gateway.ratelimit.limiter import RateLimiter
-from gateway.resilience.circuit_breaker import BreakerRegistry
-from gateway.resilience.retry import ResilientExecutor
+from gateway.resilience.circuit_breaker import BreakerRegistry, CircuitState
+from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.policies import Target
 from gateway.routing.router import Router
 from gateway.schemas import ChatCompletionRequest, Message
@@ -153,12 +153,17 @@ def test_stream_sse_refunds_on_midstream_error():
     assert seen["completed"] is False and seen["usage"] is None  # -> caller refunds
 
 
-# --- endpoint (full streaming branch) ----------------------------------------------------
+# --- endpoint + executor fallback --------------------------------------------------------
 class _StreamAdapter:
-    def __init__(self, chunks):
-        self._chunks = chunks
+    def __init__(self, chunks=None, error=None):
+        self._chunks = chunks or []
+        self._error = error
+        self.opened = 0
 
     async def stream_chat_completion(self, request):
+        self.opened += 1
+        if self._error is not None:
+            raise self._error  # raised on the first __anext__ (before any chunk)
         for chunk in self._chunks:
             yield chunk
 
@@ -169,6 +174,117 @@ class _Registry:
 
     def get(self, name):
         return self._adapters.get(name)
+
+
+async def _no_sleep(_):
+    return None
+
+
+def _executor(**kwargs):
+    return ResilientExecutor(
+        BreakerRegistry(min_calls=1, failure_threshold=0.5),
+        base_delay_s=0.0,
+        sleep=_no_sleep,
+        **kwargs,
+    )
+
+
+async def _drain(first, rest):
+    out = [] if first is None else [first]
+    out += [c async for c in rest]
+    return out
+
+
+def test_execute_stream_falls_back_before_first_byte():
+    reg = _Registry(
+        {
+            "groq": _StreamAdapter(error=UpstreamError(503, {"error": "down"})),
+            "ollama": _StreamAdapter([{"choices": [{"delta": {"content": "hi"}}]}]),
+        }
+    )
+    targets = [Target("groq", "a"), Target("ollama", "b")]
+
+    async def run():
+        ex = _executor()
+        first, rest, target = await ex.execute_stream(targets, reg, _req())
+        return target, await _drain(first, rest), reg, ex
+
+    target, out, reg, ex = asyncio.run(run())
+    assert target.provider == "ollama"  # fell back past the 503 primary
+    assert out[0]["choices"][0]["delta"]["content"] == "hi"
+    assert reg.get("groq").opened == 1  # primary was attempted
+    assert ex.breakers.get("groq").state == CircuitState.OPEN  # its open-failure was recorded
+
+
+def test_execute_stream_transport_error_falls_back():
+    reg = _Registry(
+        {
+            "groq": _StreamAdapter(error=httpx.ConnectError("refused")),
+            "ollama": _StreamAdapter([{"choices": [{"delta": {"content": "ok"}}]}]),
+        }
+    )
+    targets = [Target("groq", "a"), Target("ollama", "b")]
+
+    async def run():
+        first, rest, target = await _executor().execute_stream(targets, reg, _req())
+        return target, await _drain(first, rest)
+
+    target, out = asyncio.run(run())
+    assert target.provider == "ollama"
+    assert out[0]["choices"][0]["delta"]["content"] == "ok"
+
+
+def test_execute_stream_non_retryable_surfaces_without_fallback():
+    secondary = _StreamAdapter([{"choices": [{"delta": {"content": "x"}}]}])
+    reg = _Registry(
+        {"groq": _StreamAdapter(error=UpstreamError(400, {"error": "bad"})), "ollama": secondary}
+    )
+    targets = [Target("groq", "a"), Target("ollama", "b")]
+
+    async def run():
+        with pytest.raises(UpstreamError) as exc:
+            await _executor().execute_stream(targets, reg, _req())
+        return exc.value
+
+    err = asyncio.run(run())
+    assert err.status_code == 400
+    assert secondary.opened == 0  # a bad request is not retried against the next provider
+
+
+def test_execute_stream_all_targets_failed():
+    reg = _Registry(
+        {
+            "groq": _StreamAdapter(error=UpstreamError(503, {"error": "a"})),
+            "ollama": _StreamAdapter(error=UpstreamError(500, {"error": "b"})),
+        }
+    )
+    targets = [Target("groq", "a"), Target("ollama", "b")]
+
+    async def run():
+        with pytest.raises(AllTargetsFailed) as exc:
+            await _executor().execute_stream(targets, reg, _req())
+        return exc.value
+
+    err = asyncio.run(run())
+    assert isinstance(err.last_error, UpstreamError)
+
+
+def test_execute_stream_skips_open_circuit():
+    groq = _StreamAdapter([{"choices": [{"delta": {"content": "groq"}}]}])
+    reg = _Registry(
+        {"groq": groq, "ollama": _StreamAdapter([{"choices": [{"delta": {"content": "ollama"}}]}])}
+    )
+    targets = [Target("groq", "a"), Target("ollama", "b")]
+
+    async def run():
+        ex = _executor()
+        ex.breakers.get("groq").record_failure()  # trip groq (min_calls=1)
+        first, rest, target = await ex.execute_stream(targets, reg, _req())
+        return target, await _drain(first, rest), groq
+
+    target, out, groq = asyncio.run(run())
+    assert target.provider == "ollama"
+    assert groq.opened == 0  # open circuit -> never even attempted
 
 
 def test_streaming_endpoint_forwards_chunks_and_reconciles_tokens():

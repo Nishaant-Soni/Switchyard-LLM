@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phases 0–4 complete + Phase 5 Group 1 — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, and **SSE streaming** (token-by-token, with post-stream usage accounting). Streaming resilience (fallback up to first byte) is Phase 5 Group 2. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phases 0–5 complete — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, and **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -215,7 +215,9 @@ a slow client throttles the upstream read):
   reconciliation runs when the stream finishes (refund on a mid-stream error/disconnect).
 - Streaming **bypasses the cache** but still passes auth + rate-limit admission.
 - A stream that fails to open returns a proper error status (the first chunk is peeked before
-  committing to `200`). Cross-provider fallback *up to first byte* is Phase 5 Group 2.
+  committing to `200`), and it **falls back cross-provider up to first byte** — a dead primary is
+  retried against the next target, so the client gets a normal streamed `200` from the fallback. Once
+  the first byte is sent the choice is committed (a later mid-stream error surfaces, not retried).
 
 ## Development & tests
 
@@ -252,7 +254,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 2 | Resilience — circuit breaker + retry + cross-provider fallback | ✅ |
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
 | 4 | Semantic cache (the headline) | ✅ |
-| 5 | SSE streaming passthrough (+ Gemini usage normalization) | ◑ Group 1 done (Group 2 = fallback up to first byte) |
+| 5 | SSE streaming passthrough (+ Gemini usage normalization) | ✅ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |
 | 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |
