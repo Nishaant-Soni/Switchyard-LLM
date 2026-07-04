@@ -8,6 +8,7 @@ cache is active when cache_enabled (both degrade gracefully when off).
 
 import logging
 import math
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -19,6 +20,8 @@ from starlette.concurrency import run_in_threadpool
 from gateway.cache.embedder import SentenceTransformerEmbedder
 from gateway.cache.semantic_cache import SemanticCache, build_query_text, build_scope_key
 from gateway.config import get_settings
+from gateway.observability import metrics
+from gateway.observability.cost import PriceBook
 from gateway.providers.base import UpstreamError
 from gateway.providers.registry import ProviderRegistry
 from gateway.ratelimit.estimate import estimate_tokens
@@ -73,6 +76,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("semantic cache disabled")
 
+    app.state.pricebook = PriceBook.from_config(settings.pricing_config)
+
     logger.info(
         "gateway ready: providers=%s aliases=%s",
         app.state.registry.available(),
@@ -84,7 +89,7 @@ async def lifespan(app: FastAPI):
         await app.state.redis.aclose()
 
 
-app = FastAPI(title="Switchyard LLM Gateway", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Switchyard LLM Gateway", version="0.6.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -93,9 +98,9 @@ async def healthz():
 
 
 @app.get("/metrics")
-async def metrics():
-    # Populated in Phase 6 (Prometheus). Empty exposition for now.
-    return PlainTextResponse("", media_type="text/plain; version=0.0.4")
+async def metrics_endpoint():
+    data, content_type = metrics.render()
+    return PlainTextResponse(data, media_type=content_type)
 
 
 def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -135,14 +140,20 @@ async def _streaming_completion(
     peeks the first chunk, so a pre-first-byte failure returns a proper error status (not a broken
     200); token reconciliation runs when the stream finishes (see `on_finish`)."""
     executor: ResilientExecutor = app.state.executor
+    metrics.record_cache("bypass")  # streaming never touches the semantic cache
+    started = time.perf_counter()
     try:
         first, chunks, target = await executor.execute_stream(targets, registry, request)
     except UpstreamError as exc:
         # Non-retryable client error before first byte, forwarded verbatim.
         await _refund_tokens(tenant, estimated_tokens)
+        metrics.record_error(f"upstream_{exc.status_code}")
+        metrics.record_request(request.model, "none", "error", True)
         return JSONResponse(status_code=exc.status_code, content=exc.body)
     except AllTargetsFailed as exc:
         await _refund_tokens(tenant, estimated_tokens)
+        metrics.record_error("all_targets_failed")
+        metrics.record_request(request.model, "none", "error", True)
         last = exc.last_error
         if isinstance(last, UpstreamError):
             return JSONResponse(status_code=last.status_code, content=last.body)
@@ -152,16 +163,27 @@ async def _streaming_completion(
             "all_targets_failed",
         )
 
+    # Committed (first byte returned): record the served request + time-to-first-byte. Tokens/cost
+    # are only known when the stream finishes, so they land in on_finish.
+    metrics.observe_latency(target.provider, True, time.perf_counter() - started)
+    metrics.record_request(request.model, target.provider, "success", True)
+
     async def on_finish(usage: dict | None, completed: bool) -> None:
-        if tenant is None:
-            return
-        total = usage.get("total_tokens") if usage else None
-        if completed and total is not None:
-            await app.state.limiter.reconcile(tenant, total, estimated_tokens)
-        elif not completed:
-            # Errored / disconnected before a final usage -> refund (produced nothing complete).
-            await _refund_tokens(tenant, estimated_tokens)
-        # completed but no usage reported -> leave the estimate (don't hand out free tokens).
+        if tenant is not None:
+            total = usage.get("total_tokens") if usage else None
+            if completed and total is not None:
+                await app.state.limiter.reconcile(tenant, total, estimated_tokens)
+            elif not completed:
+                # Errored / disconnected before a final usage -> refund (produced nothing complete).
+                await _refund_tokens(tenant, estimated_tokens)
+            # completed but no usage reported -> leave the estimate (don't hand out free tokens).
+        if completed and usage:
+            prompt = int(usage.get("prompt_tokens") or 0)
+            completion = int(usage.get("completion_tokens") or 0)
+            cost = app.state.pricebook.cost_usd(target.model, prompt, completion)
+            metrics.record_usage(
+                tenant.id if tenant else "anonymous", target.provider, prompt, completion, cost
+            )
 
     logger.info(
         "stream alias=%s provider=%s model=%s", request.model, target.provider, target.model
@@ -191,6 +213,7 @@ async def chat_completions(
     if tenants.enabled:
         tenant = tenants.resolve(extract_bearer(authorization))
         if tenant is None:
+            metrics.record_error("invalid_api_key")
             return _error(401, "Invalid or missing API key.", "invalid_api_key")
 
     router: Router = app.state.router
@@ -203,6 +226,7 @@ async def chat_completions(
     try:
         targets = router.resolve(request.model)
     except KeyError:
+        metrics.record_error("invalid_request_error")
         return _error(
             400,
             f"Unknown model alias {request.model!r}. Known aliases: {router.aliases()}.",
@@ -214,6 +238,8 @@ async def chat_completions(
         estimated_tokens = estimate_tokens(request)
         rl = await app.state.limiter.check(tenant, estimated_tokens)
         if not rl.allowed:
+            metrics.record_error("rate_limit_exceeded")
+            metrics.record_request(request.model, "none", "throttled", request.stream)
             resp = _error(
                 429,
                 f"Rate limit exceeded for tenant {tenant.id!r} ({rl.blocked_dimension}).",
@@ -239,19 +265,27 @@ async def chat_completions(
         if cached is not None:
             # Hit: zero upstream tokens -> refund the estimate (request slot stays charged).
             await _refund_tokens(tenant, estimated_tokens)
+            metrics.record_cache("hit")
+            metrics.record_request(request.model, "cache", "success", False)
             logger.info("cache HIT alias=%s", request.model)
             response.headers["x-switchyard-cache"] = "hit"
             return cached
+        metrics.record_cache("miss")
 
+    started = time.perf_counter()
     try:
         result, target = await executor.execute(targets, registry, request)
     except UpstreamError as exc:
         # An upstream attempt was made but returned a non-retryable client error (forwarded
         # verbatim). Keep the request slot charged (an attempt happened), refund the tokens.
         await _refund_tokens(tenant, estimated_tokens)
+        metrics.record_error(f"upstream_{exc.status_code}")
+        metrics.record_request(request.model, "none", "error", False)
         return JSONResponse(status_code=exc.status_code, content=exc.body)
     except AllTargetsFailed as exc:
         await _refund_tokens(tenant, estimated_tokens)
+        metrics.record_error("all_targets_failed")
+        metrics.record_request(request.model, "none", "error", False)
         last = exc.last_error
         if isinstance(last, UpstreamError):
             # e.g. every target rate-limited -> forward the last upstream status/body.
@@ -262,9 +296,25 @@ async def chat_completions(
             "all_targets_failed",
         )
 
+    metrics.observe_latency(target.provider, False, time.perf_counter() - started)
+    metrics.record_request(request.model, target.provider, "success", False)
+
     # Reconcile the token bucket against actual usage: admission charged the estimate.
     if tenant is not None and result.usage is not None:
         await app.state.limiter.reconcile(tenant, result.usage.total_tokens, estimated_tokens)
+
+    # Token throughput + counterfactual cost attribution.
+    if result.usage is not None:
+        cost = app.state.pricebook.cost_usd(
+            target.model, result.usage.prompt_tokens, result.usage.completion_tokens
+        )
+        metrics.record_usage(
+            tenant.id if tenant else "anonymous",
+            target.provider,
+            result.usage.prompt_tokens,
+            result.usage.completion_tokens,
+            cost,
+        )
 
     # Cache write on a successful (non-streaming) miss — reuses the vector embedded for the read.
     if cache is not None:

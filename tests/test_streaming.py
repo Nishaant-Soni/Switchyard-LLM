@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from gateway import main
+from gateway.observability.cost import PriceBook
 from gateway.providers.base import UpstreamError
 from gateway.providers.gemini import GeminiAdapter
 from gateway.providers.openai_compat import OpenAICompatAdapter
@@ -311,6 +312,7 @@ def test_streaming_endpoint_forwards_chunks_and_reconciles_tokens():
         main.app.state.executor = ResilientExecutor(main.app.state.breakers)
         main.app.state.cache = None
         main.app.state.cache_per_tenant = False
+        main.app.state.pricebook = PriceBook({})
 
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:

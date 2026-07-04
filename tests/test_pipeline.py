@@ -21,6 +21,7 @@ import numpy as np
 
 from gateway import main
 from gateway.cache.semantic_cache import SemanticCache
+from gateway.observability.cost import PriceBook
 from gateway.providers.base import UpstreamError
 from gateway.ratelimit.limiter import RateLimiter
 from gateway.resilience.circuit_breaker import BreakerRegistry
@@ -86,6 +87,7 @@ def _install_state(behavior, cache=None, cache_per_tenant=False):
     )
     main.app.state.cache = cache
     main.app.state.cache_per_tenant = cache_per_tenant
+    main.app.state.pricebook = PriceBook({})
     return client
 
 

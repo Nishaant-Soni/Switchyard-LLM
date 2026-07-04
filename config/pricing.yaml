@@ -1,0 +1,10 @@
+# Counterfactual list prices in USD per 1M tokens (approximate paid-tier rates).
+# The gateway runs on free/local tiers; these estimate "what this traffic would cost" so the
+# gateway can attribute per-tenant cost (Phase 6). Models absent here — and local/free models —
+# cost 0. `input` = prompt tokens, `output` = completion tokens.
+models:
+  llama-3.3-70b-versatile:    { input: 0.59, output: 0.79 }   # Groq list price
+  llama-3.1-8b-instant:       { input: 0.05, output: 0.08 }   # Groq list price
+  gemini-3-flash-preview:     { input: 0.30, output: 2.50 }   # illustrative flash-tier price
+  "openai/gpt-oss-120b:free": { input: 0.0,  output: 0.0 }    # OpenRouter free tier
+  llama3.2:                   { input: 0.0,  output: 0.0 }     # local Ollama

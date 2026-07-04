@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phases 0–5 complete — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, and **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phases 0–5 complete + Phase 6 Group 1 — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte, and now **Prometheus metrics + per-tenant counterfactual cost attribution** on a live `/metrics` endpoint. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -108,7 +108,8 @@ PY
 ```
 
 Endpoints: `POST /v1/chat/completions` (streaming + non-streaming), `GET /healthz`, `GET /metrics`
-(stub until Phase 6). Send `"stream": true` for token-by-token SSE. Unknown aliases return `400`.
+(live Prometheus exposition — see [Observability](#observability)). Send `"stream": true` for
+token-by-token SSE. Unknown aliases return `400`.
 
 ### Configuring the fleet & routing
 
@@ -221,6 +222,30 @@ a slow client throttles the upstream read):
   retried against the next target, so the client gets a normal streamed `200` from the fallback. Once
   the first byte is sent the choice is committed (a later mid-stream error surfaces, not retried).
 
+### Observability
+
+`GET /metrics` serves a live Prometheus exposition (`text/plain; version=0.0.4`). Instrumentation is
+purely additive — it never changes request behavior — and label cardinality is bounded (aliases and
+providers come from config; unknown aliases collapse to `<unknown>`, error types are a fixed set), so
+no client input can blow up the series count. The series:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `switchyard_requests_total` | counter | `alias, provider, outcome, stream` | admitted routing attempts (`success`/`error`/`throttled`); a cache hit is `provider="cache"` |
+| `switchyard_request_latency_seconds` | histogram | `provider, stream` | upstream latency; **time-to-first-byte** for streams |
+| `switchyard_cache_events_total` | counter | `event` | `hit` / `miss` / `bypass` (streaming bypasses the cache) |
+| `switchyard_errors_total` | counter | `type` | error responses by type (`invalid_api_key`, `rate_limit_exceeded`, `upstream_<status>`, …) |
+| `switchyard_tokens_total` | counter | `provider, direction` | prompt / completion tokens processed |
+| `switchyard_cost_usd_total` | counter | `tenant, provider` | **counterfactual cost** — `usage × config/pricing.yaml` list prices (free/local = 0) |
+
+Cost attribution is *counterfactual*: the gateway runs on free/local tiers, so it prices the same
+traffic at the providers' paid list prices ([`config/pricing.yaml`](./config/pricing.yaml)) to answer
+"what would this have cost per tenant?". For streams, tokens + cost are recorded once the final-chunk
+`usage` arrives (in the same post-stream hook that reconciles the rate-limit bucket).
+
+> Grafana dashboards + a Prometheus/Grafana `docker compose` stack, plus **latency-/cost-aware
+> routing policies** that consume these signals in-process, land in Phase 6 Group 2.
+
 ## Development & tests
 
 ```bash
@@ -257,7 +282,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
 | 4 | Semantic cache (the headline) | ✅ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ✅ |
-| 6 | Observability + cost attribution; latency-/cost-aware routing | ☐ |
+| 6 | Observability + cost attribution; latency-/cost-aware routing | ◑ (G1: Prometheus metrics + cost done; G2: dashboards + live-aware routing) |
 | 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |
 | 9 | *(optional)* Responses-API translating front door | ☐ |
