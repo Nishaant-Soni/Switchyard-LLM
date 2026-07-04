@@ -1,9 +1,15 @@
 # Logical alias -> ordered concrete targets + routing policy.
-#   priority = try targets in listed order (cross-provider failover wiring lands in Phase 2).
-#   weighted = split traffic across targets by weight.
+#   priority      = try targets in listed order (static failover order).
+#   weighted      = split traffic across targets by weight.
+#   latency-aware = order by live per-provider EWMA latency (fastest measured first); cold/unmeasured
+#                   providers keep listed order, so it behaves like `priority` until samples arrive.
+#   cost-aware    = order by per-token list price from config/pricing.yaml (free/local first).
 aliases:
+  # latency-aware: the executor measures per-provider latency and routing shifts to the faster
+  # backend as samples arrive. Until both are sampled it behaves like priority (Groq first, Ollama
+  # fallback); a visible traffic shift needs the Ollama fallback actually running.
   fast:
-    policy: priority
+    policy: latency-aware
     targets:
       - { provider: groq,   model: llama-3.3-70b-versatile }
       - { provider: ollama, model: llama3.2 }
@@ -14,10 +20,12 @@ aliases:
       - { provider: gemini, model: gemini-3-flash-preview }  # reasoning model; needs token headroom
       - { provider: groq,   model: llama-3.3-70b-versatile }
 
+  # cost-aware: ordered by list price, so the free OpenRouter model is preferred and the paid Groq
+  # model is the fallback (free models are volatile, hence the paid backup).
   cheap:
-    policy: priority
+    policy: cost-aware
     targets:
-      - { provider: openrouter, model: "openai/gpt-oss-120b:free" }  # free models are volatile; falls back to Groq
+      - { provider: openrouter, model: "openai/gpt-oss-120b:free" }
       - { provider: groq,       model: llama-3.1-8b-instant }
 
   # Demonstrates weighted routing with only a Groq key (both targets are Groq models).

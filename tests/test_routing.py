@@ -107,3 +107,22 @@ def test_ewma_smooths_successive_latencies():
     sig.record_latency("groq", 0.1)  # seeds at 100 ms
     sig.record_latency("groq", 0.2)  # 0.3*200 + 0.7*100 = 130 ms (alpha=0.3)
     assert abs(sig.latency_ms("groq") - 130.0) < 1e-9
+
+
+def test_config_fast_latency_aware_shifts_to_faster_provider():
+    # `fast` ships as latency-aware: config order is Groq-first, but once measured the faster
+    # backend is promoted — a genuine reorder, proving the shipped policy is live (cold start is
+    # covered by test_router_resolves_alias_from_config, which resolves Groq-first with no signals).
+    sig = _signals()
+    sig.record_latency("groq", 0.5)  # 500 ms
+    sig.record_latency("ollama", 0.05)  # 50 ms
+    router = Router.from_config("config/models.yaml", signals=sig)
+    assert router.resolve("fast")[0].provider == "ollama"
+
+
+def test_config_cheap_cost_aware_prefers_free_model():
+    # `cheap` ships as cost-aware, reading the real config/pricing.yaml: the free OpenRouter model
+    # sorts ahead of the paid Groq fallback.
+    sig = RoutingSignals(PriceBook.from_config("config/pricing.yaml"))
+    router = Router.from_config("config/models.yaml", signals=sig)
+    assert [t.provider for t in router.resolve("cheap")] == ["openrouter", "groq"]

@@ -119,11 +119,15 @@ Two YAML files drive everything (config, not code):
   whose key is unset is skipped at startup (the gateway still runs on whatever's configured).
 - **`config/models.yaml`** — each alias → an ordered list of `(provider, model)` targets + a
   routing `policy`:
-  - `priority` — try targets in listed order (failover *wiring* lands in Phase 2).
+  - `priority` — try targets in listed order (static failover order).
   - `weighted` — split traffic across targets by `weight`.
+  - `latency-aware` — order by live per-provider EWMA latency (fastest measured first).
+  - `cost-aware` — order by per-token list price (free/local first).
 
-Shipped aliases: `fast` (Groq→Ollama), `smart` (Gemini→Groq), `cheap` (OpenRouter→Groq), and
-`balanced` (weighted 2:1 across two Groq models — demonstrates weighted routing with only a Groq key).
+Shipped aliases: `fast` (Groq→Ollama, **latency-aware**), `smart` (Gemini→Groq, priority), `cheap`
+(OpenRouter→Groq, **cost-aware** — prefers the free model), and `balanced` (weighted 2:1 across two
+Groq models — demonstrates weighted routing with only a Groq key). See
+[Observability → live-aware routing](#observability) for how the live-aware policies close the loop.
 
 ### Resilience
 
@@ -250,13 +254,16 @@ admin, no login) alongside the gateway. Grafana auto-provisions the datasource a
 ([`dashboards/grafana.json`](./dashboards/grafana.json)): p95 latency by provider, request rate, cache
 hit rate, token throughput, per-tenant cost, errors by type, and provider failures / fallbacks.
 
-**Live-aware routing (the control loop).** Two policies feed off the same signals — set an alias's
-`policy` to `latency-aware` or `cost-aware` in [`config/models.yaml`](./config/models.yaml):
+**Live-aware routing (the control loop).** Two policies feed off the same signals, and ship live on
+the default aliases — `fast` is `latency-aware` and `cheap` is `cost-aware` in
+[`config/models.yaml`](./config/models.yaml):
 
 - `latency-aware` orders targets by a **live per-provider EWMA latency** the executor records after
   each successful call, so traffic shifts to the faster backend as it's measured. Unmeasured providers
-  (cold start) keep their configured order and are never chosen over a measured-fast one.
-- `cost-aware` orders by per-token list price (free/local backends first).
+  (cold start) keep their configured order and are never chosen over a measured-fast one — so `fast`
+  behaves like priority until both Groq and Ollama have been sampled.
+- `cost-aware` orders by per-token list price (free/local backends first) — so `cheap` prefers the
+  free OpenRouter model and falls back to the paid Groq model.
 
 Crucially the router reads these signals **in-process**, directly from the registry the executor
 writes — it does *not* scrape the gateway's own `/metrics` (that would be circular and lag by a scrape
