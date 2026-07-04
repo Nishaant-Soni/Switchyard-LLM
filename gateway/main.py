@@ -172,12 +172,16 @@ async def _streaming_completion(
     metrics.record_request(request.model, target.provider, "success", True)
 
     async def on_finish(usage: dict | None, completed: bool) -> None:
+        if not completed:
+            # Errored / disconnected mid-stream (after first byte, so it was counted a success at
+            # commit): record the incomplete termination so a broken stream isn't invisible.
+            metrics.record_error("stream_incomplete")
         if tenant is not None:
             total = usage.get("total_tokens") if usage else None
             if completed and total is not None:
                 await app.state.limiter.reconcile(tenant, total, estimated_tokens)
             elif not completed:
-                # Errored / disconnected before a final usage -> refund (produced nothing complete).
+                # Produced nothing complete -> refund the estimate.
                 await _refund_tokens(tenant, estimated_tokens)
             # completed but no usage reported -> leave the estimate (don't hand out free tokens).
         if completed and usage:

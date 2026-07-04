@@ -110,6 +110,23 @@
           "legendFormat": "{{type}}"
         }
       ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Provider failures / fallbacks (fail/s)",
+      "description": "Per-provider upstream attempt failures the executor recovered from via fallback (or breaker-driven skips) — visible even when the request ultimately succeeded on another provider.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(switchyard_provider_failures_total[5m])) by (provider, reason)",
+          "legendFormat": "{{provider}} / {{reason}}"
+        }
+      ]
     }
   ]
 }

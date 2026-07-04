@@ -226,15 +226,17 @@ a slow client throttles the upstream read):
 
 `GET /metrics` serves a live Prometheus exposition (`text/plain; version=0.0.4`). Instrumentation is
 purely additive — it never changes request behavior — and label cardinality is bounded (aliases and
-providers come from config; unknown aliases collapse to `<unknown>`, error types are a fixed set), so
-no client input can blow up the series count. The series:
+providers come from config; an unknown alias is rejected with 400 before any request metric is
+recorded, so it never becomes a label, and error types are a fixed set), so no client input can blow
+up the series count. The series:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `switchyard_requests_total` | counter | `alias, provider, outcome, stream` | admitted routing attempts (`success`/`error`/`throttled`); a cache hit is `provider="cache"` |
 | `switchyard_request_latency_seconds` | histogram | `provider, stream` | upstream latency; **time-to-first-byte** for streams |
 | `switchyard_cache_events_total` | counter | `event` | `hit` / `miss` / `bypass` (streaming bypasses the cache) |
-| `switchyard_errors_total` | counter | `type` | error responses by type (`invalid_api_key`, `rate_limit_exceeded`, `upstream_<status>`, …) |
+| `switchyard_errors_total` | counter | `type` | error responses by type (`invalid_api_key`, `rate_limit_exceeded`, `upstream_<status>`, `stream_incomplete`, …) |
+| `switchyard_provider_failures_total` | counter | `provider, reason` | per-provider upstream attempt failures the executor recovered from via fallback (or breaker-driven skips) — visible even when the request ultimately succeeded elsewhere |
 | `switchyard_tokens_total` | counter | `provider, direction` | prompt / completion tokens processed |
 | `switchyard_cost_usd_total` | counter | `tenant, provider` | **counterfactual cost** — `usage × config/pricing.yaml` list prices (free/local = 0) |
 
@@ -244,9 +246,9 @@ traffic at the providers' paid list prices ([`config/pricing.yaml`](./config/pri
 `usage` arrives (in the same post-stream hook that reconciles the rate-limit bucket).
 
 **Dashboards.** `docker compose up` brings up Prometheus (`:9090`) + Grafana (`:3000`, anonymous
-admin, no login) alongside the gateway. Grafana auto-provisions the datasource and a 6-panel dashboard
+admin, no login) alongside the gateway. Grafana auto-provisions the datasource and a 7-panel dashboard
 ([`dashboards/grafana.json`](./dashboards/grafana.json)): p95 latency by provider, request rate, cache
-hit rate, token throughput, per-tenant cost, and errors by type.
+hit rate, token throughput, per-tenant cost, errors by type, and provider failures / fallbacks.
 
 **Live-aware routing (the control loop).** Two policies feed off the same signals — set an alias's
 `policy` to `latency-aware` or `cost-aware` in [`config/models.yaml`](./config/models.yaml):

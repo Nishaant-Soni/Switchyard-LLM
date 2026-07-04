@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 
 import httpx
 
+from gateway.observability import metrics
 from gateway.providers.base import ProviderAdapter, UpstreamError
 from gateway.providers.registry import ProviderRegistry
 from gateway.resilience.circuit_breaker import BreakerRegistry
@@ -101,12 +102,14 @@ class ResilientExecutor:
                         }
                     },
                 )
+                metrics.record_provider_failure(target.provider, "unavailable")
                 continue
 
             breaker = self.breakers.get(target.provider)
             if not breaker.allow():
                 logger.info("skip provider=%s: circuit %s", target.provider, breaker.state.value)
                 last_error = CircuitOpenError(target.provider)
+                metrics.record_provider_failure(target.provider, "circuit_open")
                 continue
 
             if attempts > 0:
@@ -123,6 +126,7 @@ class ResilientExecutor:
                 if _is_retryable_status(exc.status_code):
                     breaker.record_failure()
                     last_error = exc
+                    metrics.record_provider_failure(target.provider, f"upstream_{exc.status_code}")
                     logger.info(
                         "provider=%s status=%s -> fallback", target.provider, exc.status_code
                     )
@@ -134,6 +138,8 @@ class ResilientExecutor:
             except (httpx.TimeoutException, httpx.RequestError) as exc:
                 breaker.record_failure()
                 last_error = exc
+                reason = "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
+                metrics.record_provider_failure(target.provider, reason)
                 logger.info("provider=%s transport error -> fallback: %s", target.provider, exc)
                 continue
             else:
@@ -174,12 +180,14 @@ class ResilientExecutor:
                         }
                     },
                 )
+                metrics.record_provider_failure(target.provider, "unavailable")
                 continue
 
             breaker = self.breakers.get(target.provider)
             if not breaker.allow():
                 logger.info("skip provider=%s: circuit %s", target.provider, breaker.state.value)
                 last_error = CircuitOpenError(target.provider)
+                metrics.record_provider_failure(target.provider, "circuit_open")
                 continue
 
             if attempts > 0:
@@ -205,6 +213,7 @@ class ResilientExecutor:
                 if _is_retryable_status(exc.status_code):
                     breaker.record_failure()
                     last_error = exc
+                    metrics.record_provider_failure(target.provider, f"upstream_{exc.status_code}")
                     logger.info(
                         "stream open provider=%s status=%s -> fallback",
                         target.provider,
@@ -217,6 +226,8 @@ class ResilientExecutor:
             except (httpx.TimeoutException, httpx.RequestError) as exc:
                 breaker.record_failure()
                 last_error = exc
+                reason = "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
+                metrics.record_provider_failure(target.provider, reason)
                 logger.info(
                     "stream open provider=%s transport error -> fallback: %s", target.provider, exc
                 )

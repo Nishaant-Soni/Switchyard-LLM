@@ -4,9 +4,9 @@ All series live in a dedicated `CollectorRegistry` (not the process-global defau
 exposition is self-contained and tests can read samples deterministically. Recording is side-effect
 only and never alters request behavior — instrumentation is purely additive.
 
-Label cardinality is deliberately bounded: `alias`/`provider` come from config (client-supplied bad
-aliases collapse to `<unknown>`), `error` types are a fixed vocabulary, so no client input can blow
-up the series count.
+Label cardinality is deliberately bounded: `alias`/`provider` come from config (an unknown alias is
+rejected with 400 *before* any request metric is recorded, so it never becomes a label), and `error`
+types are a fixed vocabulary — so no client input can blow up the series count.
 
 Note: `prometheus_client` appends `_total` to counter names automatically, so the counters are
 declared without that suffix (the exposition + `get_sample_value` still use `..._total`).
@@ -50,6 +50,15 @@ ERRORS = Counter(
     ["type"],
     registry=REGISTRY,
 )
+PROVIDER_FAILURES = Counter(
+    "switchyard_provider_failures",
+    "Per-provider upstream attempt failures that triggered a cross-provider fallback (or a "
+    "breaker-driven skip). Unlike `errors_total` (final client-visible outcomes), this counts the "
+    "individual failed attempts a fallback recovered from, so a degraded-but-recovered provider is "
+    "still visible.",
+    ["provider", "reason"],  # upstream_<status> | timeout | transport | circuit_open | unavailable
+    registry=REGISTRY,
+)
 TOKENS = Counter(
     "switchyard_tokens",
     "Tokens processed, by provider and direction.",
@@ -84,6 +93,12 @@ def record_cache(event: str) -> None:
 
 def record_error(error_type: str) -> None:
     ERRORS.labels(type=error_type).inc()
+
+
+def record_provider_failure(provider: str, reason: str) -> None:
+    """One provider attempt failed and the executor advanced to the next target (or skipped an open
+    circuit). Recorded per attempt, so fallbacks that ultimately succeed stay observable."""
+    PROVIDER_FAILURES.labels(provider=provider, reason=reason).inc()
 
 
 def record_usage(

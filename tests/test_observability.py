@@ -20,6 +20,7 @@ from gateway import main
 from gateway.cache.semantic_cache import SemanticCache
 from gateway.observability import metrics
 from gateway.observability.cost import PriceBook
+from gateway.providers.base import UpstreamError
 from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import ResilientExecutor
 from gateway.routing.policies import Target
@@ -66,6 +67,14 @@ class _StreamAdapter:
             yield chunk
 
 
+class _StreamFailAdapter:
+    """Yields one chunk (commits the stream at first byte), then raises mid-stream."""
+
+    async def stream_chat_completion(self, request):
+        yield {"choices": [{"delta": {"content": "partial"}}]}
+        raise RuntimeError("mid-stream boom")
+
+
 class _Registry:
     def __init__(self, adapters):
         self._adapters = adapters
@@ -78,14 +87,16 @@ async def _no_sleep(_):
     return None
 
 
-def _install(adapter, *, cache=None, requests_per_min=100, tokens_per_min=100_000):
+def _install(
+    adapter, *, cache=None, requests_per_min=100, tokens_per_min=100_000, router=None, registry=None
+):
     client = fakeredis.aioredis.FakeRedis()
     main.app.state.tenants = TenantRegistry({KEY: Tenant("t1", requests_per_min, tokens_per_min)})
     from gateway.ratelimit.limiter import RateLimiter
 
     main.app.state.limiter = RateLimiter(client, window_s=60, now=lambda: 1000.0)
-    main.app.state.router = Router({"fast": ("priority", [Target("groq", "gm")])})
-    main.app.state.registry = _Registry({"groq": adapter})
+    main.app.state.router = router or Router({"fast": ("priority", [Target("groq", "gm")])})
+    main.app.state.registry = registry or _Registry({"groq": adapter})
     main.app.state.breakers = BreakerRegistry(min_calls=100)
     main.app.state.executor = ResilientExecutor(
         main.app.state.breakers, base_delay_s=0.0, sleep=_no_sleep
@@ -257,6 +268,65 @@ def test_streaming_records_bypass_success_and_usage():
     assert after[1] - before[1] == 1  # streamed success recorded
     # cost from the final-chunk usage: (3*1 + 7*2) / 1e6
     assert abs((after[2] - before[2]) - (3 * 1.0 + 7 * 2.0) / 1_000_000) < 1e-12
+
+
+def test_fallback_records_provider_failure():
+    # A retryable failure the executor recovers from via fallback is still observable per-provider
+    # (unlike errors_total, which only records final client-visible outcomes).
+    fail_labels = {"provider": "p1", "reason": "upstream_503"}
+    served = {"alias": "fast", "provider": "p2", "outcome": "success", "stream": "false"}
+
+    async def run():
+        registry = _Registry(
+            {
+                "p1": _Adapter(UpstreamError(503, {"error": {"message": "down", "type": "x"}})),
+                "p2": _Adapter(_response()),
+            }
+        )
+        router = Router({"fast": ("priority", [Target("p1", "m1"), Target("p2", "m2")])})
+        _install(None, router=router, registry=registry)
+        before = (
+            _val("switchyard_provider_failures_total", fail_labels),
+            _val("switchyard_requests_total", served),
+        )
+        resp = await _post(_REQ)
+        after = (
+            _val("switchyard_provider_failures_total", fail_labels),
+            _val("switchyard_requests_total", served),
+        )
+        return resp.status_code, before, after
+
+    status, before, after = asyncio.run(run())
+    assert status == 200  # primary 503'd, fell back to p2 and succeeded
+    assert after[0] - before[0] == 1  # p1's recovered-from failure is still visible
+    assert after[1] - before[1] == 1  # p2 served the success
+
+
+def test_midstream_failure_records_incomplete_error():
+    # A stream that dies after first byte is counted a success at commit; the incomplete termination
+    # must still surface as an error (otherwise a broken stream is invisible).
+    labels = {"type": "stream_incomplete"}
+
+    async def run():
+        _install(_StreamFailAdapter())
+        before = _val("switchyard_errors_total", labels)
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            try:
+                async with ac.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    json={**_REQ, "stream": True},
+                    headers=_AUTH,
+                ) as resp:
+                    async for _ in resp.aiter_bytes():
+                        pass
+            except Exception:
+                pass  # the mid-stream error propagates after on_finish (the finally) has run
+        return before, _val("switchyard_errors_total", labels)
+
+    before, after = asyncio.run(run())
+    assert after - before == 1  # broken stream recorded, not silently a success
 
 
 def test_metrics_endpoint_exposition():
