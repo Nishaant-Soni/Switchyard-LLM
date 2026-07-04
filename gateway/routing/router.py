@@ -5,6 +5,7 @@ import random
 import yaml
 
 from gateway.routing.policies import POLICIES, Target
+from gateway.routing.signals import RoutingSignals
 
 
 class Router:
@@ -12,12 +13,19 @@ class Router:
         self,
         aliases: dict[str, tuple[str, list[Target]]],
         rng: random.Random | None = None,
+        signals: RoutingSignals | None = None,
     ):
         self._aliases = aliases
         self._rng = rng or random.Random()
+        self._signals = signals
 
     @classmethod
-    def from_config(cls, path: str, rng: random.Random | None = None) -> "Router":
+    def from_config(
+        cls,
+        path: str,
+        rng: random.Random | None = None,
+        signals: RoutingSignals | None = None,
+    ) -> "Router":
         with open(path) as f:
             cfg = yaml.safe_load(f)
         aliases: dict[str, tuple[str, list[Target]]] = {}
@@ -36,7 +44,7 @@ class Router:
             if not targets:
                 raise ValueError(f"alias {name!r} has no targets")
             aliases[name] = (policy, targets)
-        return cls(aliases, rng=rng)
+        return cls(aliases, rng=rng, signals=signals)
 
     def resolve(self, alias: str) -> list[Target]:
         """Return the policy-ordered targets for an alias. Raises KeyError if unknown."""
@@ -44,7 +52,7 @@ class Router:
         if entry is None:
             raise KeyError(alias)
         policy, targets = entry
-        return POLICIES[policy](targets, self._rng)
+        return POLICIES[policy](targets, self._rng, self._signals)
 
     def aliases(self) -> list[str]:
         return list(self._aliases)

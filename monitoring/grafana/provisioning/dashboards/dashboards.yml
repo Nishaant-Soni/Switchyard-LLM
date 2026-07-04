@@ -1,0 +1,12 @@
+# Auto-load dashboards mounted at /var/lib/grafana/dashboards (see docker-compose).
+apiVersion: 1
+providers:
+  - name: switchyard
+    orgId: 1
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phases 0–5 complete + Phase 6 Group 1 — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte, and now **Prometheus metrics + per-tenant counterfactual cost attribution** on a live `/metrics` endpoint. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phases 0–6 complete — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte, **Prometheus metrics + per-tenant counterfactual cost attribution**, a **Grafana dashboard**, and **latency-/cost-aware routing** that consumes live in-process signals (the observability→routing control loop). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -243,8 +243,22 @@ traffic at the providers' paid list prices ([`config/pricing.yaml`](./config/pri
 "what would this have cost per tenant?". For streams, tokens + cost are recorded once the final-chunk
 `usage` arrives (in the same post-stream hook that reconciles the rate-limit bucket).
 
-> Grafana dashboards + a Prometheus/Grafana `docker compose` stack, plus **latency-/cost-aware
-> routing policies** that consume these signals in-process, land in Phase 6 Group 2.
+**Dashboards.** `docker compose up` brings up Prometheus (`:9090`) + Grafana (`:3000`, anonymous
+admin, no login) alongside the gateway. Grafana auto-provisions the datasource and a 6-panel dashboard
+([`dashboards/grafana.json`](./dashboards/grafana.json)): p95 latency by provider, request rate, cache
+hit rate, token throughput, per-tenant cost, and errors by type.
+
+**Live-aware routing (the control loop).** Two policies feed off the same signals — set an alias's
+`policy` to `latency-aware` or `cost-aware` in [`config/models.yaml`](./config/models.yaml):
+
+- `latency-aware` orders targets by a **live per-provider EWMA latency** the executor records after
+  each successful call, so traffic shifts to the faster backend as it's measured. Unmeasured providers
+  (cold start) keep their configured order and are never chosen over a measured-fast one.
+- `cost-aware` orders by per-token list price (free/local backends first).
+
+Crucially the router reads these signals **in-process**, directly from the registry the executor
+writes — it does *not* scrape the gateway's own `/metrics` (that would be circular and lag by a scrape
+interval). Prometheus/Grafana reflect the same underlying numbers, but for humans.
 
 ## Development & tests
 
@@ -282,7 +296,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 3 | Rate limiting — Redis, per-tenant, request + token aware | ✅ |
 | 4 | Semantic cache (the headline) | ✅ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ✅ |
-| 6 | Observability + cost attribution; latency-/cost-aware routing | ◑ (G1: Prometheus metrics + cost done; G2: dashboards + live-aware routing) |
+| 6 | Observability + cost attribution; latency-/cost-aware routing | ✅ |
 | 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |
 | 9 | *(optional)* Responses-API translating front door | ☐ |

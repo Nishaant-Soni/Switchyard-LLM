@@ -30,6 +30,7 @@ from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.policies import Target
 from gateway.routing.router import Router
+from gateway.routing.signals import RoutingSignals
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
 from gateway.streaming.sse import stream_sse
 from gateway.tenancy.auth import Tenant, TenantRegistry, extract_bearer
@@ -44,9 +45,13 @@ async def lifespan(app: FastAPI):
     client = httpx.AsyncClient(timeout=settings.request_timeout_s)
     app.state.client = client
     app.state.registry = ProviderRegistry.from_config(settings.providers_config, client)
-    app.state.router = Router.from_config(settings.models_config)
+    app.state.pricebook = PriceBook.from_config(settings.pricing_config)
+    # Live in-process signals (per-provider EWMA latency + list-price cost) shared by the executor
+    # (writer) and the router's latency-/cost-aware policies (reader).
+    app.state.signals = RoutingSignals(app.state.pricebook)
+    app.state.router = Router.from_config(settings.models_config, signals=app.state.signals)
     app.state.breakers = BreakerRegistry()
-    app.state.executor = ResilientExecutor(app.state.breakers)
+    app.state.executor = ResilientExecutor(app.state.breakers, signals=app.state.signals)
 
     app.state.tenants = TenantRegistry.from_config(settings.tenants_config)
     app.state.redis = None
@@ -76,8 +81,6 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("semantic cache disabled")
 
-    app.state.pricebook = PriceBook.from_config(settings.pricing_config)
-
     logger.info(
         "gateway ready: providers=%s aliases=%s",
         app.state.registry.available(),
@@ -89,7 +92,7 @@ async def lifespan(app: FastAPI):
         await app.state.redis.aclose()
 
 
-app = FastAPI(title="Switchyard LLM Gateway", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Switchyard LLM Gateway", version="0.7.0", lifespan=lifespan)
 
 
 @app.get("/healthz")

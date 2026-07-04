@@ -3,10 +3,12 @@ import asyncio
 import httpx
 import pytest
 
+from gateway.observability.cost import PriceBook
 from gateway.providers.base import UpstreamError
 from gateway.resilience.circuit_breaker import BreakerRegistry, CircuitBreaker, CircuitState
 from gateway.resilience.retry import AllTargetsFailed, ResilientExecutor
 from gateway.routing.policies import Target
+from gateway.routing.signals import RoutingSignals
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Usage
 
 
@@ -211,3 +213,29 @@ def test_success_records_and_serves_first_healthy():
     _, target = asyncio.run(executor.execute(targets, reg, REQUEST))
     assert target.provider == "groq"
     assert executor.breakers.get("groq").state == CircuitState.CLOSED
+
+
+def test_executor_records_served_latency_to_signals():
+    # The served provider's call latency is fed to the live-signal registry (latency-aware routing
+    # reads it). A fake clock advanced inside the adapter call makes the measured latency exact.
+    clock = FakeClock()
+    signals = RoutingSignals(PriceBook({}))
+
+    class SlowAdapter:
+        def __init__(self, dt):
+            self.dt = dt
+
+        async def chat_completion(self, request):
+            clock.advance(self.dt)  # simulate the call taking dt seconds
+            return ok_response()
+
+    reg = FakeRegistry({"groq": SlowAdapter(0.5)})
+    executor = ResilientExecutor(
+        BreakerRegistry(min_calls=2),
+        base_delay_s=0.0,
+        sleep=_no_sleep,
+        clock=clock,
+        signals=signals,
+    )
+    asyncio.run(executor.execute([Target("groq", "a")], reg, REQUEST))
+    assert signals.latency_ms("groq") == 500.0  # 0.5 s -> 500 ms (first sample seeds the EWMA)

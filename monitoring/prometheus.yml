@@ -1,0 +1,11 @@
+# Prometheus scrape config for the Switchyard gateway (Phase 6 Group 2).
+# Prometheus scrapes the gateway's /metrics endpoint; Grafana queries Prometheus.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: switchyard-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]

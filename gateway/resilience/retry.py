@@ -17,6 +17,7 @@ from gateway.providers.base import ProviderAdapter, UpstreamError
 from gateway.providers.registry import ProviderRegistry
 from gateway.resilience.circuit_breaker import BreakerRegistry
 from gateway.routing.policies import Target
+from gateway.routing.signals import RoutingSignals
 from gateway.schemas import ChatCompletionRequest, ChatCompletionResponse
 
 logger = logging.getLogger("gateway.resilience")
@@ -52,6 +53,7 @@ class ResilientExecutor:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: random.Random | None = None,
+        signals: RoutingSignals | None = None,
     ):
         self.breakers = breakers
         self.base_delay_s = base_delay_s
@@ -60,11 +62,18 @@ class ResilientExecutor:
         self.clock = clock
         self.sleep = sleep
         self.rng = rng or random.Random()
+        self.signals = signals
 
     def _backoff(self, attempt: int) -> float:
         """Exponential backoff with full jitter. attempt is 1-based (delay before attempt N)."""
         ceiling = min(self.base_delay_s * (2 ** (attempt - 1)), self.max_delay_s)
         return self.rng.uniform(0, ceiling)
+
+    def _record_latency(self, provider: str, seconds: float) -> None:
+        """Feed the served provider's call latency to the live-signal registry (latency-aware
+        routing reads it). No-op when no registry is wired."""
+        if self.signals is not None:
+            self.signals.record_latency(provider, seconds)
 
     async def execute(
         self,
@@ -107,6 +116,7 @@ class ResilientExecutor:
             attempts += 1
 
             upstream = request.model_copy(update={"model": target.model})
+            attempt_start = self.clock()
             try:
                 resp = await adapter.chat_completion(upstream)
             except UpstreamError as exc:
@@ -128,6 +138,7 @@ class ResilientExecutor:
                 continue
             else:
                 breaker.record_success()
+                self._record_latency(target.provider, self.clock() - attempt_start)
                 logger.info("served by provider=%s model=%s", target.provider, target.model)
                 return resp, target
 
@@ -179,11 +190,13 @@ class ResilientExecutor:
 
             upstream = request.model_copy(update={"model": target.model})
             chunks = adapter.stream_chat_completion(upstream)
+            attempt_start = self.clock()
             # __anext__ opens the upstream stream and may raise before the first byte.
             try:
                 first = await chunks.__anext__()
             except StopAsyncIteration:
                 breaker.record_success()  # opened fine, just no content
+                self._record_latency(target.provider, self.clock() - attempt_start)
                 logger.info(
                     "streaming via provider=%s model=%s (empty)", target.provider, target.model
                 )
@@ -210,6 +223,7 @@ class ResilientExecutor:
                 continue
             else:
                 breaker.record_success()
+                self._record_latency(target.provider, self.clock() - attempt_start)
                 logger.info("streaming via provider=%s model=%s", target.provider, target.model)
                 return first, chunks, target
 
