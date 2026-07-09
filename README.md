@@ -1,6 +1,6 @@
 # Switchyard — LLM Gateway / Inference Router
 
-> **Status:** Phases 0–6 complete — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte, **Prometheus metrics + per-tenant counterfactual cost attribution**, a **Grafana dashboard**, and **latency-/cost-aware routing** that consumes live in-process signals (the observability→routing control loop). Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
+> **Status:** Phases 0–7 complete — resilient multi-provider routing, per-tenant rate limiting, a **semantic cache**, **SSE streaming** with post-stream usage accounting *and* cross-provider fallback up to first byte, **Prometheus metrics + per-tenant counterfactual cost attribution**, a **Grafana dashboard**, **latency-/cost-aware routing** that consumes live in-process signals (the observability→routing control loop), and a **reproducible benchmark harness + scripted resilience demo** producing the headline cache numbers. Design is locked in [`PRD.md`](./PRD.md); code is being built phase by phase (see [Roadmap](#roadmap)).
 
 A provider-agnostic **LLM gateway**: a reverse proxy that exposes a single, stable,
 **OpenAI-compatible** API on the front and routes to many heterogeneous providers on the
@@ -306,7 +306,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 4 | Semantic cache (the headline) | ✅ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ✅ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ✅ |
-| 7 | Benchmark harness — reproducible X / Y / Z numbers | ◑ (G1: harness + numbers + sweep done; G2: resilience demo + write-up) |
+| 7 | Benchmark harness — reproducible X / Y / Z numbers | ✅ |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |
 | 9 | *(optional)* Responses-API translating front door | ☐ |
 
@@ -346,8 +346,30 @@ and is why the default `cache_similarity_threshold` was tuned from 0.85 to **0.9
 | 0.95 | 5.2% | 0.0% | 100.0% | 29.2% |
 
 > Numbers are machine- and workload-dependent; the scoping (`d`, threshold, embedding model, modeled
-> miss latency) is stated so they're honest and reproducible. The résumé-bullet framing and the
-> recorded resilience / traffic-shift demo land in Phase 7 Group 2.
+> miss latency) is stated so they're honest and reproducible.
+
+In résumé terms: *at a 40% workload duplicate rate, the semantic cache achieved a **35% hit rate**,
+cutting counterfactual request cost by **~35%** and p95 latency by **~16%*** (`all-MiniLM-L6-v2`,
+threshold 0.90).
+
+### Resilience demo
+
+```bash
+python -m bench.demo_resilience          # self-contained; no keys, no Docker
+```
+
+Launches a mock upstream (two backends) + a real gateway (temp config; real `config/` untouched),
+drives traffic in two phases, and takes the primary down mid-run:
+
+- **Phase 1 (healthy):** every request served by the primary (`mock_a`).
+- **Phase 2 (primary 503s):** traffic **transparently falls back** to `mock_b`; after the failure
+  rate crosses the breaker's threshold, `mock_a`'s circuit trips **open** and it's skipped entirely —
+  yet **every client request still returns 200**.
+
+The script prints the per-phase serving provider, the breaker snapshot (`/healthz`), and the
+`switchyard_provider_failures_total` / `switchyard_requests_total` counters (`/metrics`). Under
+`docker compose up`, the same signals animate Grafana's *Provider failures / fallbacks* and *Request
+rate by provider* panels (a recorded GIF is Phase 8 polish).
 
 ---
 
