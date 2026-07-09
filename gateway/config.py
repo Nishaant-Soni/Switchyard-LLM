@@ -22,7 +22,9 @@ class Settings(BaseSettings):
     # Semantic cache (Phase 4). Enabled by default; the MiniLM model loads lazily on the first
     # cache lookup (first request downloads ~80MB). Set cache_enabled=false for routing-only.
     cache_enabled: bool = True
-    cache_similarity_threshold: float = 0.85  # provisional; tuned via the Phase 7 sweep
+    # Tuned via the Phase 7 sweep: 0.85 was too loose (~45% precision on MiniLM); 0.90 gives
+    # ~91-97% precision at ~89% recall. See docs/iteration_18.md.
+    cache_similarity_threshold: float = 0.90
     cache_ttl_s: float = 3600.0
     cache_max_entries: int = 10_000
     cache_per_tenant: bool = False  # shared across tenants by default (max hit rate)

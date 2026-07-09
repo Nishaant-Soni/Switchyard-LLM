@@ -306,7 +306,7 @@ Each phase is independently demoable and maps to a clause of the target resume b
 | 4 | Semantic cache (the headline) | ✅ |
 | 5 | SSE streaming passthrough (+ Gemini usage normalization) | ✅ |
 | 6 | Observability + cost attribution; latency-/cost-aware routing | ✅ |
-| 7 | Benchmark harness — reproducible X / Y / Z numbers | ☐ |
+| 7 | Benchmark harness — reproducible X / Y / Z numbers | ◑ (G1: harness + numbers + sweep done; G2: resilience demo + write-up) |
 | 8 | Polish & packaging (one-command stack, ARCHITECTURE.md, CI) | ☐ |
 | 9 | *(optional)* Responses-API translating front door | ☐ |
 
@@ -317,19 +317,37 @@ Add Phase 4 (cache, for the number) and Phase 6 (dashboard) for a complete submi
 
 ## Benchmark (headline numbers)
 
-Filled in after Phase 7. The number is reproducible and honestly scoped — its value depends on the
-workload's duplicate rate, which is stated explicitly.
-
-> *At a workload duplicate rate of **d%**, the semantic cache achieved a **Z%** hit rate, reducing
-> notional cost by **X%** and p95 latency by **Y%**.* (embedding model: `all-MiniLM-L6-v2`; similarity threshold: `T`)
-
-Run with:
+Produced by a reproducible harness (`bench/`) — a synthetic workload with a tunable semantic-duplicate
+rate `d` run through the **real** MiniLM + FAISS cache. Cost is a **counterfactual** (`usage ×
+config/pricing.yaml`, since all providers are free); miss (upstream) latency is a seeded lognormal
+model, so the numbers reproduce (hit rate and cost exactly; latency within ~0.2%).
 
 ```bash
-python bench/run_benchmark.py     # baseline (cache off) vs. cache on; threshold sweep; d = 20% and 40%
+python -m bench.run_benchmark            # baseline vs cache-on + threshold sweep, at d = 20% and 40%
 ```
 
-Cost is a **counterfactual** ("what this would cost on paid tiers"), since all providers are free.
+**Results** (seed 42, n = 400, `all-MiniLM-L6-v2`, threshold **0.90**, modeled miss latency
+lognormal(median 0.6 s, σ 0.5)):
+
+| duplicate rate d | hit rate (Z) | cost ↓ (X) | p50 ↓ | p95 ↓ (Y) | p99 ↓ |
+|---|---|---|---|---|---|
+| 20% | 17.5% | 18.2% | 9.4% | 3.7% | 3.7% |
+| 40% | 35.2% | 34.7% | 32.0% | 15.7% | 13.0% |
+
+**Threshold tuning (the point of the sweep).** MiniLM places many *distinct* prompts close together,
+so a loose threshold serves wrong answers. The sweep (at d = 20%) shows the precision/recall tradeoff
+and is why the default `cache_similarity_threshold` was tuned from 0.85 to **0.90**:
+
+| threshold | hit rate | false-hit rate | precision | recall |
+|---|---|---|---|---|
+| 0.85 | 33.5% | 18.5% | 44.8% | 83.3% |
+| 0.88 | 22.5% | 5.8% | 74.4% | 93.1% |
+| **0.90** | **17.5%** | **1.5%** | **91.4%** | **88.9%** |
+| 0.95 | 5.2% | 0.0% | 100.0% | 29.2% |
+
+> Numbers are machine- and workload-dependent; the scoping (`d`, threshold, embedding model, modeled
+> miss latency) is stated so they're honest and reproducible. The résumé-bullet framing and the
+> recorded resilience / traffic-shift demo land in Phase 7 Group 2.
 
 ---
 
