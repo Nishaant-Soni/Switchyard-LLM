@@ -124,3 +124,15 @@ def test_benchmark_latency_drops_with_hits():
     items = [_item(i % 2, f"base{i % 2}", should_hit=(i >= 2)) for i in range(6)]
     base, on = _run_pair(items)
     assert rb._pct(on["latencies_ms"], 50) < rb._pct(base["latencies_ms"], 50)
+
+
+# --- reproducibility guard ----------------------------------------------------------------
+def test_harness_default_threshold_matches_gateway_default():
+    # The headline table must reproduce with the gateway's *tuned* default threshold. A stale
+    # harness default (was 0.85) prints numbers the sweep rejected as too loose (~45% precision),
+    # so `python -m bench.run_benchmark` would not reproduce the README's 0.90 headline.
+    from gateway.config import Settings
+
+    harness_default = rb._parse_args([]).threshold
+    gateway_default = Settings.model_fields["cache_similarity_threshold"].default
+    assert harness_default == gateway_default == 0.90

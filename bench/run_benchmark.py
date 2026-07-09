@@ -274,7 +274,12 @@ def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="Semantic-cache benchmark harness")
     p.add_argument("--n", type=int, default=400, help="requests per duplicate-rate run")
     p.add_argument("--d", type=float, nargs="+", default=[0.2, 0.4], help="duplicate rates")
-    p.add_argument("--threshold", type=float, default=0.85, help="headline similarity threshold")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.90,
+        help="headline similarity threshold (mirrors the gateway's tuned default, config.py)",
+    )
     p.add_argument(
         "--sweep",
         type=float,
