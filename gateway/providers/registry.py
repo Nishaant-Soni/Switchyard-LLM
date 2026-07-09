@@ -3,6 +3,7 @@ are skipped (logged), so the gateway runs with whatever subset of the fleet is c
 
 import logging
 import os
+import re
 
 import httpx
 import yaml
@@ -12,6 +13,15 @@ from gateway.providers.gemini import GeminiAdapter
 from gateway.providers.openai_compat import OpenAICompatAdapter
 
 logger = logging.getLogger("gateway.registry")
+
+# ${VAR} / ${VAR:-default} substitution in config strings — lets one providers.yaml serve both a
+# local run (localhost defaults) and Docker Compose (service-name URLs via env), e.g. Ollama.
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env(value: str) -> str:
+    return _ENV_PATTERN.sub(lambda m: os.getenv(m.group(1)) or (m.group(2) or ""), value)
+
 
 ADAPTER_TYPES: dict[str, type[OpenAICompatAdapter]] = {
     "openai_compat": OpenAICompatAdapter,
@@ -38,13 +48,14 @@ class ProviderRegistry:
                     logger.warning("provider %r skipped: env %s not set", name, env_var)
                     continue
             adapter_cls = ADAPTER_TYPES[pcfg.get("type", "openai_compat")]
+            base_url = _expand_env(pcfg["base_url"])
             adapters[name] = adapter_cls(
                 name=name,
-                base_url=pcfg["base_url"],
+                base_url=base_url,
                 api_key=api_key,
                 client=client,
             )
-            logger.info("provider %r ready -> %s", name, pcfg["base_url"])
+            logger.info("provider %r ready -> %s", name, base_url)
         return cls(adapters)
 
     def get(self, name: str) -> ProviderAdapter | None:

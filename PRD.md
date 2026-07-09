@@ -40,7 +40,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 | Provider | Role in the fleet | Surface | Notes |
 |---|---|---|---|
 | **Groq** | Fast path (low latency) | OpenAI-compatible | LPU-served open models (Llama, Qwen, etc.); high tokens/sec. Free tier is request- *and* token-capped per day. |
-| **Google Gemini** | Quality / multimodal path | OpenAI-compatible at `https://generativelanguage.googleapis.com/v1beta/openai/` | Frontier-class Flash, 1M context, native vision. Has a streaming quirk (see §10). |
+| **Google Gemini** | Quality / multimodal path | OpenAI-compatible at `https://generativelanguage.googleapis.com/v1beta/openai/` | Frontier-class Flash, 1M context, native vision. Has a streaming quirk (see §9). |
 | **OpenRouter** | Breadth path | OpenAI-compatible | Single key, many `:free` models; useful as a wide fallback pool. |
 | **Ollama (local)** | Always-available offline fallback | OpenAI-compatible (`/v1`) | Runs on the laptop; no network, no quota. Guarantees the fallback chain always terminates in *something*. |
 
@@ -65,17 +65,16 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
                                     │                         │
                               ┌─────▼─────┐            ┌───────▼────────┐
                               │   Redis   │            │ Prometheus +   │
-                              │ (limits,  │            │ Grafana        │
-                              │  cache    │            │ (dashboards)   │
-                              │  vectors) │            └────────────────┘
-                              └───────────┘
+                              │  (limits) │            │ Grafana        │
+                              └───────────┘            │ (dashboards)   │
+                                                       └────────────────┘
 ```
 
 **Request lifecycle (non-streaming):** auth → rate-limit → cache read → route → (breaker-guarded) upstream call with retry/fallback → token reconcile → cost attribution → cache write → metrics → respond.
 
 > **Note — "route" splits into resolution and dispatch.** The single "route" step above is two stages in the code. **Alias resolution/validation** (alias → ordered targets) is a cheap, side-effect-free in-memory lookup, so it runs *up front* — before rate-limit admission *and* before the cache read — which lets an unknown alias return a client-side `400` that touches no provider, does no billable work, and consumes no quota. **Provider dispatch** (the breaker/retry/fallback upstream call) is the expensive stage and stays *after* the cache read, so a cache hit still short-circuits it. So the effective order is: auth → alias resolution → rate-limit → cache read → dispatch → reconcile → cache write → respond.
 
-**Control plane vs. data plane:** routing policies and provider/model config live in YAML loaded at startup (and hot-reloadable as a stretch goal). Live signals consumed by the control plane (per-provider p95 latency, breaker state) are computed from the observability layer — closing the loop so observability is an *input* to routing, not a bolt-on.
+**Control plane vs. data plane:** routing policies and provider/model config live in YAML loaded at startup (and hot-reloadable as a stretch goal). The control plane consumes live signals (per-provider **EWMA latency** the executor records in-process after each call, breaker state) **directly, not by scraping Prometheus** — closing the loop so observability is an *input* to routing, not a bolt-on. (As implemented, the semantic cache is **in-process FAISS**, so Redis holds only rate-limit counters; Redis-vector is the documented shared-state alternative — see §7.3.)
 
 ## 7. Component specifications
 
@@ -84,15 +83,15 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Front door — Chat Completions:** `POST /v1/chat/completions` is the primary, always-on surface. Existing OpenAI SDK clients work by changing only `base_url`.
 - **Front door — Responses (optional, Phase 9):** OpenAI now *recommends* the item-centered Responses API (`/v1/responses`) for new projects. Rather than reimplement it, the gateway can expose a `/v1/responses` endpoint that **translates Responses ↔ Chat Completions** at the boundary (decode the typed-item `input`/`instructions` into canonical messages; re-encode `choices` into typed `output` items; map streaming event types both ways). This turns the OpenAI API divergence into a demonstration of the gateway's core purpose — absorbing protocol heterogeneity — and mirrors real ecosystem bridges (e.g. `wire_api`-style adapters).
 - **Adapter pattern (Strategy):** each provider implements a `ProviderAdapter` interface. Because all four targets are OpenAI-compatible (Chat Completions), the base adapter is near pass-through (swap `base_url`, auth header, and model name); per-provider subclasses handle quirks (auth scheme, streaming-usage normalization, unsupported params).
-- **Why it matters (interview):** decoupling caller from backend is the whole point of a gateway; the adapter layer is where that decoupling lives, and the optional Responses front door shows the same principle applied at the *inbound* protocol boundary, not just the outbound one.
+- **Why it matters:** decoupling caller from backend is the whole point of a gateway; the adapter layer is where that decoupling lives, and the optional Responses front door applies the same principle at the *inbound* protocol boundary, not just the outbound one.
 
 ### 7.2 Routing / control plane
 - Input: logical model alias (e.g. `fast`, `smart`, `cheap`) → ordered list of concrete provider targets + a policy.
 - Policies (pluggable):
   - **Priority / failover** — try targets in order; first healthy one wins.
   - **Weighted** — split traffic by weight (canary / A-B).
-  - **Latency-aware** — pick the target with the best current p95 (consumes observability).
-  - **Cost-aware** — pick the cheapest target meeting constraints (consumes pricing table).
+  - **Latency-aware** — order targets by the best live per-provider latency (as implemented: an **EWMA the executor records in-process**, read by the router at resolve time — not scraped back from Prometheus).
+  - **Cost-aware** — order by per-token list price (cheapest / free-local first; consumes the pricing table).
 - **Why it matters:** identical in shape to load-balancer policy design; "routing policy is a swappable strategy, not hardcoded" is the defensible statement.
 
 ### 7.3 Semantic cache (headline feature)
@@ -102,11 +101,11 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Index:** FAISS (in-process) for the benchmark; Redis-vector as the shared-state alternative for multi-instance.
 - **Streaming:** streaming requests bypass the cache entirely (read *and* write). Assembling a streamed miss into a cache entry for future non-streaming hits was scoped as a stretch and **not implemented**.
 - **Rate-limit interaction:** the cache read sits *after* rate-limit admission, so a request slot is still charged (duplicate-prompt spam can't bypass throttling), but a **cache hit refunds the token estimate** back to ~0 — a hit consumes no upstream tokens, so the tenant's token budget (= real upstream cost) is restored, making the cache's cost savings visible in the limiter itself.
-- **Why it matters:** this produces the resume number (cost ↓, p95 ↓ at a measured hit rate). Owning the threshold-tuning story carries an entire interview.
+- **Why it matters:** this produces the headline number (cost ↓, p95 ↓ at a measured hit rate); the similarity-threshold sweep (precision/recall tradeoff) is the core tuning story.
 
 ### 7.4 Rate limiting
 - **Per API key / tenant**, enforced in Redis so counters survive horizontal scaling.
-- Algorithm: token-bucket *or* sliding-window-counter (document the choice and tradeoff).
+- Algorithm: **token-bucket** (chosen over a sliding-window counter for burst tolerance and a cheap atomic refill; both buckets refill + check in one Redis Lua script so the two dimensions stay consistent under concurrency).
 - **Two-dimensional:** limit on request rate *and* on token rate, because LLM cost is token-denominated and **token limits often bind before request limits** (e.g. a provider allowing ~1,000 req/day but only ~100K tokens/day caps you at ~100 calls/day for 1K-token calls).
 - **Token accounting:** estimate tokens pre-call (heuristic / `tiktoken` approximation) for the admission check, then **reconcile** against the provider's actual `usage` in the response. Pre/post reconciliation is a deliberate depth point.
 - **Refund on no-token outcomes:** reconcile-against-actual generalizes to failures — when a request produces no usable, accounted usage (every target failed, a non-retryable provider error, a cache hit, or a stream that errors/disconnects before its final `usage` chunk), the charged token estimate is **refunded** (reconciled against 0). A stream that *completes* reconciles against the final chunk's `usage` as normal. The **request slot stays charged** whenever a real upstream attempt was made, so retrying a dead route is still throttled by the request-rate limit. (An unknown alias is rejected before admission, so it is never charged in the first place.)
@@ -116,7 +115,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Circuit breaker per provider:** closed → open (after failure-rate threshold) → half-open (probe after reset timeout) → closed. Stops hammering a dead backend and lets it recover.
 - **Retry:** exponential backoff **with jitter**; retries go to the *next provider in the fallback chain*, not the same one (cross-provider fallback), because retrying a struggling backend amplifies its load.
 - **Timeout budget:** per-attempt and per-request deadlines so a slow provider can't stall the whole request.
-- **Why it matters:** this is the resilience vocabulary the current resume lacks. Being able to explain the half-open state and why fallback is cross-provider is staff-level signal.
+- **Why it matters:** the half-open state and cross-provider (not same-provider) fallback are the non-obvious parts of a correct resilience design.
 
 ### 7.6 SSE streaming
 - Upstream streamed with `httpx` streaming; each chunk is **parsed → normalized → re-emitted** to the client via FastAPI `StreamingResponse` as an async generator (not raw byte passthrough — parsing is needed to tap the final `usage` and to fix Gemini's per-chunk usage, so the outbound stream is uniformly spec-conformant regardless of backend).
@@ -126,7 +125,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 - **Why it matters:** demonstrating *why* streaming complicates the rest of the system — and still giving it fallback up to first byte — is the signal.
 
 ### 7.7 Observability
-- `prometheus_client` exposes: latency histograms (per provider, p50/p95/p99), counters (requests, cache hits/misses, errors by type, tokens in/out), and cost gauges per tenant.
+- `prometheus_client` exposes: latency histograms (per provider; p50/p95/p99 derived in Grafana), and counters for requests (by alias/provider/outcome/stream), cache events (hit/miss/bypass), errors by type, per-provider attempt failures recovered via fallback, tokens (prompt/completion), and **counterfactual cost** per tenant + provider. (As implemented, cost is a cumulative **counter**, not a gauge.)
 - **Cost attribution:** computed from `usage` × a per-model **list-price** table. Since the providers are free, this is a *counterfactual* ("what this would cost on paid tiers") — which is honest and still makes the caching cost-savings number concrete and demonstrable.
 - Grafana dashboard renders it; latency-aware and cost-aware routing consume these same signals.
 - **Why it matters:** you can't operate a multi-provider system you can't see, and the metrics feed routing — observability is part of the control loop.
@@ -134,15 +133,7 @@ The gateway needs **genuinely heterogeneous** backends so that routing and failo
 ### 7.8 Multi-tenancy
 - API keys map to tenants. Each tenant has its own rate-limit budget, cost attribution, and optional cache scope.
 
-## 8. The resume bullet (target)
-
-Drafted up front so every phase maps to part of it:
-
-> *Built a provider-agnostic LLM gateway (FastAPI/async) fronting 4 model providers with an OpenAI-compatible API, implementing policy-based routing, circuit-breaker + cross-provider failover, per-tenant token-aware rate limiting, and a semantic cache that cut request cost by **~X%** and p95 latency by **~Y%** at a **Z%** hit rate; full Prometheus/Grafana observability with per-tenant cost attribution.*
-
-`X`, `Y`, `Z` come from the benchmark (§9), not from guessing.
-
-## 9. Success metrics & benchmark methodology
+## 8. Success metrics & benchmark methodology
 
 The headline number must be **reproducible and honestly scoped**, because the cache's effect depends on the workload's duplicate rate.
 
@@ -154,7 +145,7 @@ The headline number must be **reproducible and honestly scoped**, because the ca
 
 **Acceptance:** one-command `docker compose up` brings up gateway + Redis + Prometheus + Grafana + Ollama; a client using the OpenAI SDK against `base_url=localhost` gets correct streamed and non-streamed completions; the benchmark script reproduces the headline numbers; the resilience demo is recordable.
 
-## 10. Known provider quirks (normalization requirements)
+## 9. Known provider quirks (normalization requirements)
 
 A real gateway earns its keep by normalizing provider differences. Documented quirks to handle:
 
@@ -165,7 +156,7 @@ A real gateway earns its keep by normalizing provider differences. Documented qu
 - **Free-tier 429s are normal, not exceptional:** the fallback chain is the intended handler for quota exhaustion, not an error path.
 - **Responses ↔ Chat Completions translation boundary (if Phase 9 is built):** the two formats differ structurally — Responses is item-centered (typed `input`/`output` items, `instructions`, hosted-tool items, reasoning items) vs. Chat Completions' message/`choices` shape; structured outputs use `text.format` vs. `response_format`; function-calling shapes differ; and streaming uses different SSE event types (`response.output_text.delta` etc. vs. `chat.completion.chunk`). The hard parts are tool-call id/index stability across streaming deltas and reasoning metadata. Note also that `previous_response_id`/server-side statefulness has no equivalent on a stateless Chat Completions backend, so a translating front door must either store conversation state in the gateway or require clients to send full context (stateless mode).
 
-## 11. Risks & mitigations
+## 10. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
@@ -175,10 +166,10 @@ A real gateway earns its keep by normalizing provider differences. Documented qu
 | "Zero cost" undermined by always-on hosting | Run locally; deliverable is repo + README + recorded demo + benchmark, not 24/7 uptime. |
 | Scope creep (turning it into a product) | Non-goals (§3) are firm; UI is Grafana only. |
 
-## 12. Tech stack (all free / local)
+## 11. Tech stack (all free / local)
 
 - **Service:** Python 3.11, FastAPI, `httpx.AsyncClient` (async I/O — gateway is I/O-bound on upstream calls).
-- **State:** Redis (rate-limit counters, optional shared cache vectors).
+- **State:** Redis (rate-limit counters). The semantic cache is in-process FAISS; Redis-vector is an optional shared-state alternative (§7.3), not the default.
 - **Cache embeddings:** `sentence-transformers` (`all-MiniLM-L6-v2`), CPU.
 - **ANN index:** FAISS (in-process) and/or Redis-vector.
 - **Token estimate:** `tiktoken` (approximation for non-OpenAI tokenizers; reconciled against provider `usage`).

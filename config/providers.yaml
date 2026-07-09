@@ -19,5 +19,6 @@ providers:
     auth: bearer
 
   ollama:
-    base_url: http://localhost:11434/v1
+    # Local by default; Docker Compose sets OLLAMA_BASE_URL to the service URL (http://ollama:11434/v1).
+    base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
     auth: none                         # local, no key required

@@ -63,3 +63,17 @@ def test_provider_conformance(provider: str, model: str):
     assert resp.choices, "response had no choices"
     assert resp.choices[0].message.content is not None
     assert resp.usage is not None and resp.usage.total_tokens > 0
+
+
+def test_base_url_env_expansion(monkeypatch):
+    # A provider base_url may use ${VAR:-default} so one config serves both local and Docker
+    # (e.g. Ollama: localhost by default, the compose service URL when OLLAMA_BASE_URL is set).
+    from gateway.providers.registry import _expand_env
+
+    monkeypatch.delenv("DEMO_OLLAMA_URL", raising=False)
+    assert (
+        _expand_env("${DEMO_OLLAMA_URL:-http://localhost:11434/v1}") == "http://localhost:11434/v1"
+    )
+    monkeypatch.setenv("DEMO_OLLAMA_URL", "http://ollama:11434/v1")
+    assert _expand_env("${DEMO_OLLAMA_URL:-http://localhost:11434/v1}") == "http://ollama:11434/v1"
+    assert _expand_env("https://api.groq.com/openai/v1") == "https://api.groq.com/openai/v1"

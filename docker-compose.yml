@@ -7,13 +7,24 @@ services:
       - .env
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://ollama:11434/v1   # reach the Ollama service, not localhost
     depends_on:
       - redis
+      - ollama
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # After the stack is up, pull the fallback model once:
+    #   docker compose exec ollama ollama pull llama3.2
 
   prometheus:
     image: prom/prometheus:latest
@@ -38,3 +49,6 @@ services:
       - ./dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+
+volumes:
+  ollama-models:
